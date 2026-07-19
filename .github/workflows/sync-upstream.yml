@@ -1,0 +1,74 @@
+name: Sync vendored MCP servers from upstream
+
+# True real-time isn't achievable (GitHub doesn't let an external repo
+# subscribe to another repo's pushes without the upstream owner setting
+# that up) -- daily polling is the closest real approximation. Runs on a
+# schedule and can also be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: '17 4 * * *' # once a day, off the hour to avoid GitHub's peak-time scheduling delays
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout creator-tools
+        uses: actions/checkout@v4
+        with:
+          path: creator-tools
+
+      - name: Shallow-clone upstream servers repo
+        run: git clone --depth 1 https://github.com/modelcontextprotocol/servers.git upstream
+
+      - name: Sync each vendored server folder
+        id: sync
+        run: |
+          set -euo pipefail
+          cd creator-tools
+          UPSTREAM_COMMIT=$(cd ../upstream && git rev-parse HEAD)
+          CHANGED=0
+
+          for name in fetch git time filesystem memory sequentialthinking; do
+            SRC="../upstream/src/$name"
+            DEST="mcp_servers/$name"
+
+            if [ ! -d "$SRC" ]; then
+              echo "::warning::upstream/src/$name no longer exists -- skipping (may need manual attention if it was renamed/removed)"
+              continue
+            fi
+
+            # Preserve our own provenance marker files, then rsync
+            # everything else so removed-upstream files are removed here
+            # too, not just new/changed ones added.
+            rsync -a --delete \
+              --exclude='.vendored-from-commit' \
+              --exclude='.vendored-from-source' \
+              "$SRC/" "$DEST/"
+
+            if ! git diff --quiet -- "$DEST"; then
+              CHANGED=1
+              echo "$UPSTREAM_COMMIT" > "$DEST/.vendored-from-commit"
+              git add "$DEST"
+            fi
+          done
+
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Open a PR if anything changed
+        if: steps.sync.outputs.changed == '1'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: creator-tools
+          commit-message: 'chore: sync vendored MCP servers from upstream'
+          branch: auto-sync/upstream-mcp-servers
+          title: 'Sync vendored MCP servers from upstream'
+          body: |
+            Automated daily sync from [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers) (`main`).
+
+            Never auto-merged — review the diff before merging, same as any other upstream dependency bump.
+          delete-branch: true
