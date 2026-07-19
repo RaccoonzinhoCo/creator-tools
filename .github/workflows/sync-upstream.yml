@@ -22,32 +22,54 @@ jobs:
         with:
           path: creator-tools
 
-      - name: Shallow-clone upstream servers repo
-        run: git clone --depth 1 https://github.com/modelcontextprotocol/servers.git upstream
-
-      - name: Sync each vendored server folder
+      - name: Sync each vendored server folder from its own upstream
         id: sync
         run: |
           set -euo pipefail
           cd creator-tools
-          UPSTREAM_COMMIT=$(cd ../upstream && git rev-parse HEAD)
           CHANGED=0
 
-          for name in fetch git time filesystem memory sequentialthinking; do
-            SRC="../upstream/src/$name"
+          # name|upstream-repo|subdir-within-that-repo ('.' for repo root)
+          SERVERS=(
+            "fetch|https://github.com/modelcontextprotocol/servers.git|src/fetch"
+            "git|https://github.com/modelcontextprotocol/servers.git|src/git"
+            "time|https://github.com/modelcontextprotocol/servers.git|src/time"
+            "filesystem|https://github.com/modelcontextprotocol/servers.git|src/filesystem"
+            "memory|https://github.com/modelcontextprotocol/servers.git|src/memory"
+            "sequentialthinking|https://github.com/modelcontextprotocol/servers.git|src/sequentialthinking"
+            "context7|https://github.com/upstash/context7.git|packages/mcp"
+            "playwright|https://github.com/microsoft/playwright-mcp.git|."
+          )
+
+          declare -A CLONED_REPOS
+
+          for entry in "${SERVERS[@]}"; do
+            IFS='|' read -r name repo subdir <<< "$entry"
             DEST="mcp_servers/$name"
 
+            if [ -z "${CLONED_REPOS[$repo]:-}" ]; then
+              CLONE_DIR="../upstream_$(echo "$repo" | md5sum | cut -d' ' -f1)"
+              git clone --depth 1 "$repo" "$CLONE_DIR"
+              CLONED_REPOS[$repo]="$CLONE_DIR"
+            fi
+            CLONE_DIR="${CLONED_REPOS[$repo]}"
+            UPSTREAM_COMMIT=$(cd "$CLONE_DIR" && git rev-parse HEAD)
+            SRC="$CLONE_DIR/$subdir"
+
             if [ ! -d "$SRC" ]; then
-              echo "::warning::upstream/src/$name no longer exists -- skipping (may need manual attention if it was renamed/removed)"
+              echo "::warning::$repo's $subdir no longer exists -- skipping $name (may need manual attention if it was renamed/removed)"
               continue
             fi
 
             # Preserve our own provenance marker files, then rsync
             # everything else so removed-upstream files are removed here
-            # too, not just new/changed ones added.
+            # too, not just new/changed ones added. Exclude .git if the
+            # subdir is a whole-repo vendor (subdir == '.').
             rsync -a --delete \
               --exclude='.vendored-from-commit' \
               --exclude='.vendored-from-source' \
+              --exclude='.git' \
+              --exclude='node_modules' \
               "$SRC/" "$DEST/"
 
             if ! git diff --quiet -- "$DEST"; then
@@ -68,7 +90,7 @@ jobs:
           branch: auto-sync/upstream-mcp-servers
           title: 'Sync vendored MCP servers from upstream'
           body: |
-            Automated daily sync from [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers) (`main`).
+            Automated daily sync from each vendored server's own upstream repository (see README.md for the source mapping).
 
             Never auto-merged — review the diff before merging, same as any other upstream dependency bump.
           delete-branch: true
