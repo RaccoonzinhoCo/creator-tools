@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout creator-tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: creator-tools
 
@@ -83,7 +83,7 @@ jobs:
 
       - name: Open a PR if anything changed
         if: steps.sync.outputs.changed == '1'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           path: creator-tools
           commit-message: 'chore: sync vendored MCP servers from upstream'
