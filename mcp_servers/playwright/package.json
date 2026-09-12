@@ -1,6 +1,6 @@
 {
   "name": "@playwright/mcp",
-  "version": "0.0.78",
+  "version": "0.0.80",
   "description": "Playwright Tools for MCP",
   "repository": {
     "type": "git",
@@ -37,12 +37,12 @@
     }
   },
   "dependencies": {
-    "playwright": "1.62.0-alpha-1783623505000",
-    "playwright-core": "1.62.0-alpha-1783623505000"
+    "playwright": "1.63.0-alpha-2026-08-31",
+    "playwright-core": "1.63.0-alpha-2026-08-31"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
-    "@playwright/test": "1.62.0-alpha-1783623505000",
+    "@playwright/test": "1.63.0-alpha-2026-08-31",
     "@types/node": "^24.3.0"
   },
   "bin": {
