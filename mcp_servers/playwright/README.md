@@ -416,7 +416,7 @@ Playwright MCP server supports following arguments. They can be provided in the 
 | --cdp-endpoint <endpoint> | CDP endpoint to connect to.<br>*env* `PLAYWRIGHT_MCP_CDP_ENDPOINT` |
 | --cdp-header <headers...> | CDP headers to send with the connect request, multiple can be specified.<br>*env* `PLAYWRIGHT_MCP_CDP_HEADERS` |
 | --cdp-timeout <timeout> | timeout in milliseconds for connecting to CDP endpoint, defaults to 30000ms<br>*env* `PLAYWRIGHT_MCP_CDP_TIMEOUT` |
-| --codegen <lang> | specify the language to use for code generation, possible values: "typescript", "none". Default is "typescript".<br>*env* `PLAYWRIGHT_MCP_CODEGEN` |
+| --codegen <lang> | specify the language to use for code generation, possible values: "typescript", "python", "java", "csharp", "none". Default is "typescript".<br>*env* `PLAYWRIGHT_MCP_CODEGEN` |
 | --config <path> | path to the configuration file.<br>*env* `PLAYWRIGHT_MCP_CONFIG` |
 | --console-level <level> | level of console messages to return: "error", "warning", "info", "debug". Each level includes the messages of more severe levels.<br>*env* `PLAYWRIGHT_MCP_CONSOLE_LEVEL` |
 | --device <device> | device to emulate, for example: "iPhone 15"<br>*env* `PLAYWRIGHT_MCP_DEVICE` |
@@ -424,30 +424,35 @@ Playwright MCP server supports following arguments. They can be provided in the 
 | --executable-path <path> | path to the browser executable.<br>*env* `PLAYWRIGHT_MCP_EXECUTABLE_PATH` |
 | --extension | Connect to a running browser instance (Edge/Chrome only). Requires the "Playwright Extension" to be installed.<br>*env* `PLAYWRIGHT_MCP_EXTENSION` |
 | --endpoint <endpoint> | Bound browser endpoint to connect to.<br>*env* `PLAYWRIGHT_MCP_ENDPOINT` |
+| --file-paths <mode> | how file paths are rendered in tool results, "relative" to the workspace root or "absolute". Default is "relative".<br>*env* `PLAYWRIGHT_MCP_FILE_PATHS` |
 | --grant-permissions <permissions...> | List of permissions to grant to the browser context, for example "geolocation", "clipboard-read", "clipboard-write".<br>*env* `PLAYWRIGHT_MCP_GRANT_PERMISSIONS` |
 | --headless | run browser in headless mode, headed by default<br>*env* `PLAYWRIGHT_MCP_HEADLESS` |
 | --host <host> | host to bind server to. Default is localhost. Use 0.0.0.0 to bind to all interfaces.<br>*env* `PLAYWRIGHT_MCP_HOST` |
+| --idle-timeout <timeout> | close the browser after this many milliseconds without a completed tool call, the next tool call relaunches it. Defaults to one hour for headless browsers, never for headed ones, 0 disables.<br>*env* `PLAYWRIGHT_MCP_IDLE_TIMEOUT` |
 | --ignore-https-errors | ignore https errors<br>*env* `PLAYWRIGHT_MCP_IGNORE_HTTPS_ERRORS` |
 | --init-page <path...> | path to TypeScript file to evaluate on Playwright page object<br>*env* `PLAYWRIGHT_MCP_INIT_PAGE` |
 | --init-script <path...> | path to JavaScript file to add as an initialization script. The script will be evaluated in every page before any of the page's scripts. Can be specified multiple times.<br>*env* `PLAYWRIGHT_MCP_INIT_SCRIPT` |
 | --isolated | keep the browser profile in memory, do not save it to disk.<br>*env* `PLAYWRIGHT_MCP_ISOLATED` |
-| --image-responses <mode> | whether to send image responses to the client. Can be "allow" or "omit", Defaults to "allow".<br>*env* `PLAYWRIGHT_MCP_IMAGE_RESPONSES` |
+| --image-responses <mode> | whether to send image responses to the client. Can be "allow", "omit" or "only". With "only", a response that carries an image consists of the image parts alone, without the text part. Defaults to "allow".<br>*env* `PLAYWRIGHT_MCP_IMAGE_RESPONSES` |
 | --no-sandbox | disable the sandbox for all process types that are normally sandboxed.<br>*env* `PLAYWRIGHT_MCP_NO_SANDBOX` |
-| --output-dir <path> | path to the directory for output files.<br>*env* `PLAYWRIGHT_MCP_OUTPUT_DIR` |
+| --no-webmcp | do not collect or expose the tools that a page registers through the WebMCP API.<br>*env* `PLAYWRIGHT_MCP_WEBMCP=false` |
+| --output-dir <path> | path to the directory for automatically named output files, for example a screenshot taken without an explicit file name. Files with an explicit name are resolved against the workspace root instead and are not affected by this option.<br>*env* `PLAYWRIGHT_MCP_OUTPUT_DIR` |
 | --output-max-size <bytes> | Threshold for evicting old output files, in bytes.<br>*env* `PLAYWRIGHT_MCP_OUTPUT_MAX_SIZE` |
-| --output-mode <mode> | whether to save snapshots, console messages, network logs to a file or to the standard output. Can be "file" or "stdout". Default is "stdout".<br>*env* `PLAYWRIGHT_MCP_OUTPUT_MODE` |
 | --port <port> | port to listen on for SSE transport.<br>*env* `PLAYWRIGHT_MCP_PORT` |
+| --profile-dir-name <name> | name of the profile directory in the user data dir to connect to with --extension, for example "Profile 1". Defaults to the last used profile that has the extension installed.<br>*env* `PLAYWRIGHT_MCP_PROFILE_DIR_NAME` |
 | --proxy-bypass <bypass> | comma-separated domains to bypass proxy, for example ".com,chromium.org,.domain.com"<br>*env* `PLAYWRIGHT_MCP_PROXY_BYPASS` |
 | --proxy-server <proxy> | specify proxy server, for example "http://myproxy:3128" or "socks5://myproxy:8080"<br>*env* `PLAYWRIGHT_MCP_PROXY_SERVER` |
 | --sandbox | enable the sandbox for all process types that are normally not sandboxed.<br>*env* `PLAYWRIGHT_MCP_SANDBOX` |
 | --save-session | Whether to save the Playwright MCP session into the output directory.<br>*env* `PLAYWRIGHT_MCP_SAVE_SESSION` |
 | --secrets <path> | path to a file containing secrets in the dotenv format<br>*env* `PLAYWRIGHT_MCP_SECRETS_FILE` |
 | --shared-browser-context | reuse the same browser context between all connected HTTP clients.<br>*env* `PLAYWRIGHT_MCP_SHARED_BROWSER_CONTEXT` |
+| --snapshot-boxes | include each element's bounding box as [box=x,y,width,height] in snapshots. Coordinates are viewport-relative, in CSS pixels.<br>*env* `PLAYWRIGHT_MCP_SNAPSHOT_BOXES` |
 | --snapshot-mode <mode> | when taking snapshots for responses, specifies the mode to use. Can be "full" or "none". Default is "full".<br>*env* `PLAYWRIGHT_MCP_SNAPSHOT_MODE` |
 | --storage-state <path> | path to the storage state file for isolated sessions.<br>*env* `PLAYWRIGHT_MCP_STORAGE_STATE` |
 | --test-id-attribute <attribute> | specify the attribute to use for test ids, defaults to "data-testid"<br>*env* `PLAYWRIGHT_MCP_TEST_ID_ATTRIBUTE` |
 | --timeout-action <timeout> | specify action timeout in milliseconds, defaults to 5000ms<br>*env* `PLAYWRIGHT_MCP_TIMEOUT_ACTION` |
 | --timeout-navigation <timeout> | specify navigation timeout in milliseconds, defaults to 60000ms<br>*env* `PLAYWRIGHT_MCP_TIMEOUT_NAVIGATION` |
+| --timeout-settle <timeout> | how long to wait after each action for triggered work to settle, in milliseconds, defaults to 500ms<br>*env* `PLAYWRIGHT_MCP_TIMEOUT_SETTLE` |
 | --user-agent <ua string> | specify user agent string<br>*env* `PLAYWRIGHT_MCP_USER_AGENT` |
 | --user-data-dir <path> | path to the user data directory. If not specified, a temporary directory will be created.<br>*env* `PLAYWRIGHT_MCP_USER_DATA_DIR` |
 | --viewport-size <size> | specify browser viewport size in pixels, for example "1280x720"<br>*env* `PLAYWRIGHT_MCP_VIEWPORT_SIZE` |
@@ -661,6 +666,12 @@ npx @playwright/mcp@latest --config path/to/config.json
   saveSession?: boolean;
 
   /**
+   * Whether to collect and expose the tools that a page registers through the
+   * experimental WebMCP API. Enabled by default.
+   */
+  webmcp?: boolean;
+
+  /**
    * Reuse the same browser context between all connected HTTP clients.
    */
   sharedBrowserContext?: boolean;
@@ -673,7 +684,9 @@ npx @playwright/mcp@latest --config path/to/config.json
   secrets?: Record<string, string>;
 
   /**
-   * The directory to save output files.
+   * The directory for automatically named output files, for example a screenshot taken without an
+   * explicit file name. Files with an explicit name are resolved against the workspace root instead
+   * and are not affected by this option.
    */
   outputDir?: string;
 
@@ -729,18 +742,42 @@ npx @playwright/mcp@latest --config path/to/config.json
      * Configures default expect timeout: https://playwright.dev/docs/test-timeouts#expect-timeout. Defaults to 5000ms.
      */
     expect?: number;
+
+    /**
+     * How long to wait after each action for triggered work (navigations, requests) to settle before responding. Defaults to 500ms.
+     */
+    settle?: number;
+
+    /**
+     * Close the browser after this many milliseconds without a tool call, and relaunch it on the next one.
+     * Defaults to one hour for headless browsers Playwright launched, and to no timeout for headed or attached ones. Pass 0 to disable.
+     * The CLI shuts the whole session down instead of relaunching.
+     */
+    idle?: number;
   };
 
   /**
-   * Whether to send image responses to the client. Can be "allow", "omit", or "auto". Defaults to "auto", which sends images if the client can display them.
+   * Whether to send image responses to the client. Can be "allow", "omit", or "only". Defaults to "allow".
+   * With "only", a response that carries an image consists of the image parts alone, without the text part.
    */
-  imageResponses?: 'allow' | 'omit';
+  imageResponses?: 'allow' | 'omit' | 'only';
+
+  /**
+   * How file paths are rendered in tool results. Can be "relative" to the workspace root or "absolute". Defaults to "relative".
+   */
+  filePaths?: 'relative' | 'absolute';
 
   snapshot?: {
     /**
      * When taking snapshots for responses, specifies the mode to use.
      */
     mode?: 'full' | 'none';
+
+    /**
+     * Whether to include each element's bounding box as [box=x,y,width,height] in snapshots.
+     * Coordinates are viewport-relative, in CSS pixels (Element.getBoundingClientRect).
+     */
+    boxes?: boolean;
   };
 
   /**
@@ -754,7 +791,7 @@ npx @playwright/mcp@latest --config path/to/config.json
   /**
    * Specify the language to use for code generation.
    */
-  codegen?: 'typescript' | 'none';
+  codegen?: 'typescript' | 'python' | 'java' | 'csharp' | 'none';
 }
 ```
 
@@ -881,7 +918,7 @@ http.createServer(async (req, res) => {
   - Parameters:
     - `level` (string): Level of the console messages to return. Each level includes the messages of more severe levels. Defaults to "info".
     - `all` (boolean, optional): Return all console messages since the beginning of the session, not just since the last navigation. Defaults to false.
-    - `filename` (string, optional): Filename to save the console messages to. If not provided, messages are returned as text.
+    - `filename` (string, optional): File name to save the console messages to. Relative file names are resolved against the workspace root. If not provided, messages are returned as text.
   - Read-only: **true**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -910,6 +947,19 @@ http.createServer(async (req, res) => {
 
 <!-- NOTE: This has been generated via update-readme.js -->
 
+- **browser_emulate_media**
+  - Title: Emulate media features
+  - Description: Emulate CSS media features for the page, for example switch between the light and dark color scheme. Omitted parameters are left unchanged; null clears an override.
+  - Parameters:
+    - `colorScheme` (optional): Emulates the prefers-color-scheme media feature
+    - `reducedMotion` (optional): Emulates the prefers-reduced-motion media feature
+    - `forcedColors` (optional): Emulates the forced-colors media feature
+    - `contrast` (optional): Emulates the prefers-contrast media feature
+    - `media` (optional): Changes the CSS media type of the page
+  - Read-only: **false**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
 - **browser_evaluate**
   - Title: Evaluate JavaScript
   - Description: Evaluate JavaScript expression on page or element
@@ -917,7 +967,7 @@ http.createServer(async (req, res) => {
     - `element` (string, optional): Human-readable element description used to obtain permission to interact with the element
     - `target` (string, optional): Exact target element reference from the page snapshot, or a unique element selector
     - `function` (string): () => { /* code */ } or (element) => { /* code */ } when element is provided
-    - `filename` (string, optional): Filename to save the result to. If not provided, result is returned as text.
+    - `filename` (string, optional): File name to save the result to. Relative file names are resolved against the workspace root. If not provided, result is returned as text.
   - Read-only: **false**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -993,7 +1043,7 @@ http.createServer(async (req, res) => {
   - Parameters:
     - `index` (integer): 1-based index of the request, as printed by browser_network_requests.
     - `part` (string, optional): Return only this part of the request. Omit to return full details.
-    - `filename` (string, optional): Filename to save the result to. If not provided, output is returned as text.
+    - `filename` (string, optional): File name to save the result to. Relative file names are resolved against the workspace root. If not provided, output is returned as text.
   - Read-only: **true**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -1004,7 +1054,7 @@ http.createServer(async (req, res) => {
   - Parameters:
     - `static` (boolean): Whether to include successful static resources like images, fonts, scripts, etc. Defaults to false.
     - `filter` (string, optional): Only return requests whose URL matches this regexp (e.g. "/api/.*user").
-    - `filename` (string, optional): Filename to save the network requests to. If not provided, requests are returned as text.
+    - `filename` (string, optional): File name to save the network requests to. Relative file names are resolved against the workspace root. If not provided, requests are returned as text.
   - Read-only: **true**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -1033,7 +1083,7 @@ http.createServer(async (req, res) => {
   - Description: Run a Playwright code snippet. Unsafe: executes arbitrary JavaScript in the Playwright server process and is RCE-equivalent.
   - Parameters:
     - `code` (string, optional): A JavaScript function containing Playwright code to execute. It will be invoked with a single argument, page, which you can use for any page interaction. For example: `async (page) => { await page.getByRole('button', { name: 'Submit' }).click(); return await page.title(); }`
-    - `filename` (string, optional): Load code from the specified file. If both code and filename are provided, code will be ignored.
+    - `filename` (string, optional): Load code from the specified file. Relative file names are resolved against the workspace root. If both code and filename are provided, code will be ignored.
   - Read-only: **false**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -1054,7 +1104,7 @@ http.createServer(async (req, res) => {
   - Description: Capture accessibility snapshot of the current page, this is better than screenshot
   - Parameters:
     - `target` (string, optional): Exact target element reference from the page snapshot, or a unique element selector
-    - `filename` (string, optional): Save snapshot to markdown file instead of returning it in the response.
+    - `filename` (string, optional): Save snapshot to a file instead of returning it in the response. Relative file names are resolved against the workspace root.
     - `depth` (number, optional): Limit the depth of the snapshot tree
     - `boxes` (boolean, optional): Include each element's bounding box as [box=x,y,width,height] in the snapshot. Coordinates are viewport-relative, in CSS pixels (Element.getBoundingClientRect)
   - Read-only: **true**
@@ -1067,8 +1117,8 @@ http.createServer(async (req, res) => {
   - Parameters:
     - `element` (string, optional): Human-readable element description used to obtain permission to interact with the element
     - `target` (string, optional): Exact target element reference from the page snapshot, or a unique element selector
-    - `type` (string): Image format for the screenshot. Default is png.
-    - `filename` (string, optional): File name to save the screenshot to. Defaults to `page-{timestamp}.{png|jpeg}` if not specified. Prefer relative file names to stay within the output directory.
+    - `type` (string, optional): Image format for the screenshot. If unset, inferred from the filename extension, otherwise png.
+    - `filename` (string, optional): File name to save the screenshot to. Relative file names are resolved against the workspace root. If not specified, the screenshot is saved into the output directory as `page-{timestamp}.{png|jpeg|webp}`.
     - `fullPage` (boolean, optional): When true, takes a screenshot of the full scrollable page, instead of the currently visible viewport. Cannot be used with element screenshots.
     - `scale` (string): Image resolution scale. "css" produces a screenshot sized in CSS pixels (smaller, consistent across devices). "device" produces a high-resolution screenshot using device pixels (larger, accounts for the device pixel ratio). Default is css.
   - Read-only: **true**
@@ -1327,7 +1377,7 @@ http.createServer(async (req, res) => {
   - Title: Restore storage state
   - Description: Restore storage state (cookies, local storage) from a file. This clears existing cookies and local storage before restoring.
   - Parameters:
-    - `filename` (string): Path to the storage state file to restore from
+    - `filename` (string): Path to the storage state file to restore from. Relative file names are resolved against the workspace root.
   - Read-only: **false**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -1336,7 +1386,7 @@ http.createServer(async (req, res) => {
   - Title: Save storage state
   - Description: Save storage state (cookies, local storage) to a file for later reuse
   - Parameters:
-    - `filename` (string, optional): File name to save the storage state to. Defaults to `storage-state-{timestamp}.json` if not specified.
+    - `filename` (string, optional): File name to save the storage state to. Relative file names are resolved against the workspace root. If not specified, the storage state is saved into the output directory as `storage-state-{timestamp}.json`.
   - Read-only: **true**
 
 </details>
@@ -1385,6 +1435,14 @@ http.createServer(async (req, res) => {
 
 <!-- NOTE: This has been generated via update-readme.js -->
 
+- **browser_start_recording**
+  - Title: Start recording user actions
+  - Description: Start recording actions that the user performs in the browser as Playwright code. Use it when the user wants to demonstrate a flow manually. Call browser_stop_recording when the user says they are done to retrieve the recorded actions.
+  - Parameters: None
+  - Read-only: **true**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
 - **browser_start_tracing**
   - Title: Start tracing
   - Description: Start trace recording
@@ -1397,8 +1455,18 @@ http.createServer(async (req, res) => {
   - Title: Start video
   - Description: Start video recording
   - Parameters:
-    - `filename` (string, optional): Filename to save the video.
+    - `filename` (string, optional): File name to save the video to. Relative file names are resolved against the workspace root. If not specified, the video is saved into the output directory as `video-{timestamp}.webm`.
     - `size` (object, optional): Video size
+    - `fps` (number, optional): Video frame rate in frames per second, defaults to 25
+    - `cursor` (boolean, optional): Render an animated mouse cursor that travels to each action point. Paces actions by 800ms so that the cursor has time to travel.
+  - Read-only: **true**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_stop_recording**
+  - Title: Stop recording user actions
+  - Description: Stop the recording started with browser_start_recording and return the recorded actions as Playwright code.
+  - Parameters: None
   - Read-only: **true**
 
 <!-- NOTE: This has been generated via update-readme.js -->
@@ -1440,11 +1508,12 @@ http.createServer(async (req, res) => {
 
 - **browser_video_show_actions**
   - Title: Show action overlays
-  - Description: Annotate subsequent actions performed on the page with a callout that names the action and highlights the target element. Useful while video recording or screencasting.
+  - Description: Annotate subsequent actions performed on the page with a callout that names the action and, when styled, marks the action point and highlights the target element. Useful while video recording or screencasting.
   - Parameters:
     - `duration` (number, optional): How long each action annotation stays on screen, in milliseconds. Defaults to 500.
     - `position` (string, optional): Where to place the action title relative to the page. Defaults to top-right.
     - `cursor` (string, optional): Cursor decoration for pointer actions. "pointer" (default) animates a mouse pointer from the previous action point to the next one; "none" disables the cursor decoration.
+    - `style` (object, optional): Styles of the action decorations.
   - Read-only: **true**
 
 </details>
@@ -1526,7 +1595,7 @@ http.createServer(async (req, res) => {
   - Title: Save as PDF
   - Description: Save page as PDF
   - Parameters:
-    - `filename` (string, optional): File name to save the pdf to. Defaults to `page-{timestamp}.pdf` if not specified. Prefer relative file names to stay within the output directory.
+    - `filename` (string, optional): File name to save the pdf to. Relative file names are resolved against the workspace root. If not specified, the pdf is saved into the output directory as `page-{timestamp}.pdf`.
   - Read-only: **true**
 
 </details>
