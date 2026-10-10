@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import type * as playwright from '../../..';
+import type * as playwright from 'playwright';
 
 export type ToolCapability =
   'config' |
@@ -142,6 +142,12 @@ export type Config = {
   saveSession?: boolean;
 
   /**
+   * Whether to collect and expose the tools that a page registers through the
+   * experimental WebMCP API. Enabled by default.
+   */
+  webmcp?: boolean;
+
+  /**
    * Reuse the same browser context between all connected HTTP clients.
    */
   sharedBrowserContext?: boolean;
@@ -154,7 +160,9 @@ export type Config = {
   secrets?: Record<string, string>;
 
   /**
-   * The directory to save output files.
+   * The directory for automatically named output files, for example a screenshot taken without an
+   * explicit file name. Files with an explicit name are resolved against the workspace root instead
+   * and are not affected by this option.
    */
   outputDir?: string;
 
@@ -210,18 +218,42 @@ export type Config = {
      * Configures default expect timeout: https://playwright.dev/docs/test-timeouts#expect-timeout. Defaults to 5000ms.
      */
     expect?: number;
+
+    /**
+     * How long to wait after each action for triggered work (navigations, requests) to settle before responding. Defaults to 500ms.
+     */
+    settle?: number;
+
+    /**
+     * Close the browser after this many milliseconds without a tool call, and relaunch it on the next one.
+     * Defaults to one hour for headless browsers Playwright launched, and to no timeout for headed or attached ones. Pass 0 to disable.
+     * The CLI shuts the whole session down instead of relaunching.
+     */
+    idle?: number;
   };
 
   /**
-   * Whether to send image responses to the client. Can be "allow", "omit", or "auto". Defaults to "auto", which sends images if the client can display them.
+   * Whether to send image responses to the client. Can be "allow", "omit", or "only". Defaults to "allow".
+   * With "only", a response that carries an image consists of the image parts alone, without the text part.
    */
-  imageResponses?: 'allow' | 'omit';
+  imageResponses?: 'allow' | 'omit' | 'only';
+
+  /**
+   * How file paths are rendered in tool results. Can be "relative" to the workspace root or "absolute". Defaults to "relative".
+   */
+  filePaths?: 'relative' | 'absolute';
 
   snapshot?: {
     /**
      * When taking snapshots for responses, specifies the mode to use.
      */
     mode?: 'full' | 'none';
+
+    /**
+     * Whether to include each element's bounding box as [box=x,y,width,height] in snapshots.
+     * Coordinates are viewport-relative, in CSS pixels (Element.getBoundingClientRect).
+     */
+    boxes?: boolean;
   };
 
   /**
@@ -235,5 +267,5 @@ export type Config = {
   /**
    * Specify the language to use for code generation.
    */
-  codegen?: 'typescript' | 'none';
+  codegen?: 'typescript' | 'python' | 'java' | 'csharp' | 'none';
 };

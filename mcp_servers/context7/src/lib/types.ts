@@ -1,3 +1,5 @@
+import type { ToolCallOutcome } from "./tool-names.js";
+
 export interface SearchResult {
   id: string;
   title: string;
@@ -26,10 +28,12 @@ export type DocumentState = "initial" | "finalized" | "error" | "delete";
 export type ContextRequest = {
   query: string;
   libraryId: string;
+  language?: string;
 };
 
 export type ContextResponse = {
   data: string;
+  outcome: ToolCallOutcome;
 };
 
 export interface ClientContext {
@@ -39,6 +43,9 @@ export interface ClientContext {
     ide?: string;
     version?: string;
   };
+  plugin?: string;
+  mcpEndpoint?: "/mcp" | "/mcp/oauth";
+  mcpAuthMode?: "observe" | "required";
   transport?: "stdio" | "http";
   sessionId?: string;
   /** Mutable: set by the upstream API layer when the backend signals the

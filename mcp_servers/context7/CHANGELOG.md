@@ -1,5 +1,110 @@
 # @upstash/context7-mcp
 
+## 4.3.0
+
+### Minor Changes
+
+- 2c0f362: Add an optional `language` argument to `query-docs`. When the agent knows the programming language the user writes in, Context7 ranks code examples in that language first.
+
+## 4.2.1
+
+### Patch Changes
+
+- c30f279: Verify OAuth JWT access tokens from the authorization server (Clerk) strictly on the hosted HTTP transport: signature, issuer, a `typ` of `at+jwt`, expiry with a minute of clock tolerance, and the token's `aud`. Clerk ID tokens and session JWTs, which share the issuer, now get HTTP 401. The audience is compared against the `RESOURCE_URL` origin, `/mcp` and `/mcp/oauth` (override with `MCP_OAUTH_ALLOWED_AUDIENCES`); `MCP_OAUTH_AUDIENCE_ENFORCEMENT` defaults to `observe`, which admits a mismatch and logs the OAuth client ID and audience (once per token every ten minutes), and `required` answers 401. These JWTs count as `oauth` in authentication telemetry, a token the Context7 API rejects on a tool call is challenged on the next request, and a rejected OAuth token now stays rejected in the per-replica cache for ten minutes instead of thirty seconds.
+- dd48abc: query-docs now sets `isError` on its result when the documentation request fails (invalid library ID, API or network error), so clients that branch on `isError` no longer treat the error text as documentation.
+- 6116042: Report the actual assigned HTTP port when `--port 0` requests an ephemeral port.
+
+## 4.2.0
+
+### Minor Changes
+
+- 48eb9f0: Require credentials on the HTTP `/mcp` endpoint by default. Set `MCP_AUTH_ENFORCEMENT=observe` to keep anonymous `/mcp` access and record privacy-safe authentication migration events; `/mcp/oauth` and Claude Code plugin requests keep their challenge in both modes. `/mcp/oauth` stays as a compatibility alias, each endpoint publishes its own OAuth protected-resource metadata, an empty or scheme-only `Authorization: Bearer` header counts as a missing credential, and CORS responses expose `WWW-Authenticate` and `MCP-Session-Id`.
+
+### Patch Changes
+
+- 126379b: Answer an expired or revoked OAuth access token (`oat_…`) on the hosted HTTP transport with an HTTP 401 and a `WWW-Authenticate: Bearer error="invalid_token"` challenge, so MCP clients refresh the token instead of showing a tool error. The server checks the token against the Context7 API before serving the request, caches the verdict in memory per token hash for about a minute on each replica, and fails open when the check is unavailable. Set `MCP_OAUTH_TOKEN_VALIDATION=off` to disable the check. When the Context7 API still rejects an OAuth token on a tool call, the tool text now says the sign-in expired instead of describing API keys.
+
+## 4.1.3
+
+### Patch Changes
+
+- afdd129: Over HTTP, answer `subscriptions/listen` with an acknowledgement and an immediate `complete` result instead of a "Subscription limit reached" error, and stop logging those refusals. Context7 has no change notifications, so the stream closes at once. Stdio subscriptions stay disabled. Removes the `MCP_MAX_SUBSCRIPTIONS` setting.
+- 2b7c4f0: Update the undici dependency to 7.30.
+
+## 4.1.2
+
+### Patch Changes
+
+- 16095a9: Update CLI prompt, terminal display, and browser launch dependencies. The CLI now declares Node.js 22.13 or later, which its dependencies already need. Update the MCP server JWT and OpenTelemetry dependencies.
+- 72181dd: Serve a SEP-2127 server card at `/mcp/server-card`.
+
+## 4.1.1
+
+### Patch Changes
+
+- 5ed5e9a: Disable unused MCP notification subscriptions so clients do not hold open SSE streams for static tool, prompt, and resource collections.
+
+## 4.1.0
+
+### Minor Changes
+
+- 915abfe: Add bounded OpenTelemetry metrics for MCP requests, tools, authentication, and upstream API calls, exposed for Prometheus on the HTTP server's internal telemetry port.
+
+## 4.0.7
+
+### Patch Changes
+
+- 0087bab: Allow the Claude Code plugin to use anonymous access when its API key header is empty.
+
+## 4.0.6
+
+### Patch Changes
+
+- 5a7039b: Add per-request bearer-token providers and Vercel Marketplace resource OIDC validation.
+- 80e681a: Return sanitized JSON-RPC errors for rejected MCP request bodies.
+
+## 4.0.5
+
+### Patch Changes
+
+- 21c3dd4: Require authentication and track usage separately for the Claude Code plugin.
+- 4e980f6: Increase the default HTTP subscription capacity and allow deployments to configure it with `MCP_MAX_SUBSCRIPTIONS`.
+- 2a851fc: Remove the legacy AES-CBC client-IP header now that authenticated assertions are deployed.
+
+## 4.0.4
+
+### Patch Changes
+
+- 8fa6c6b: Honor the advertised `X-Context7-API-Key` header in HTTP MCP requests.
+- 794cc6b: Authenticate hosted MCP client-IP forwarding with short-lived AES-GCM assertions.
+
+## 4.0.3
+
+### Patch Changes
+
+- 769c6cd: Advertise Clerk as the OAuth authorization server so clients validate authorization responses against the issuer that Clerk returns.
+
+## 4.0.2
+
+### Patch Changes
+
+- 67528f2: Add a 60s `AbortSignal.timeout()` to both Context7 API calls in `lib/api.ts`. Without a signal a stalled backend call rides undici's ~300s default before failing. 60s is generous: these are vector queries with p99.9 ~3.2s, and no request exceeded 30s across a full day of production traffic.
+- c68104e: Disable SSE keepalive heartbeats on the HTTP handler (`keepAliveMs: 0`). Every tool is a millisecond vector query, so no legitimate exchange needs a heartbeat — but a hung exchange kept alive by heartbeats can never be reaped by a proxy's stream idle timeout. One such hang is deterministic: a 2025-era JSON-RPC batch carrying a request plus its own `notifications/cancelled` gets no response for the cancelled request (per spec), the SDK transport then never closes the stream, and heartbeats kept it alive until the gateway's 1200s hard cap — the dominant source of leaked upstream connections in the 2026-08-11 mcp.context7.com outage. With heartbeats off, silent hangs go idle and the proxy reaps them at its idle timeout.
+
+## 4.0.1
+
+### Patch Changes
+
+- af7e4ad: Stop forcing `responseMode: "sse"` on the HTTP handler and use the SDK default `"auto"` instead. Forcing `"sse"` put every response on an SSE stream, and those streams were not released: concurrent upstream streams went from ~10 before v4.0.0 to over 5000, exhausting the gateway connection pool and returning 503 `reset reason: overflow` on `mcp.context7.com`. Traffic and latency were unchanged over that period, so the growth was not load.
+
+  With `"auto"` a request is answered with a single JSON body unless a handler emits a related message before its result, which upgrades that one exchange to SSE. No tool emits progress today, so modern-protocol responses are now plain JSON. The 2025-era legacy fallback is constructed without a `responseMode` and still streams over SSE, so it is unaffected.
+
+## 4.0.0
+
+### Major Changes
+
+- 8d52608: Migrate the MCP server to the v2 SDK (`@modelcontextprotocol/{node,server,client}` 2.0.0) and the 2026-07-28 protocol revision. HTTP serving is now stateless for both modern and legacy clients, and Redis-backed sessions are removed.
+
 ## 3.2.5
 
 ### Patch Changes
