@@ -15,6 +15,10 @@ vi.mock("jose", async () => {
 const TENANT_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ENTRA_ISSUER = `https://login.microsoftonline.com/${TENANT_ID}/v2.0`;
 const AUDIENCE = "6ff6a635-03d9-472d-a7f1-dc98a4e5fde2";
+const originalOAuthAuthServerUrl = process.env.OAUTH_AUTH_SERVER_URL;
+const originalOAuthJwksUrl = process.env.OAUTH_JWKS_URL;
+const VERCEL_ISSUER = "https://integrations.vercel.com/oac_123456789";
+const VERCEL_AUDIENCE = "https://integrations.vercel.com/context7/icfg_1234567890";
 
 async function loadModule() {
   vi.resetModules();
@@ -31,18 +35,41 @@ function makeFetchResponse(init: Partial<Response> & { jsonData?: unknown }): Re
   } as Response;
 }
 
-function makeEntraToken(payload: jose.JWTPayload): string {
-  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+function makeEntraToken(payload: jose.JWTPayload, typ = "JWT"): string {
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ })).toString("base64url");
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
   return `${header}.${body}.signature`;
 }
 
+function makeClerkToken(payload: jose.JWTPayload, typ = "at+jwt"): string {
+  return makeEntraToken({ aud: "https://mcp.context7.com/mcp", ...payload }, typ);
+}
+
+const CLERK_VERIFY_OPTIONS = {
+  issuer: "https://clerk.context7.com",
+  typ: "at+jwt",
+  clockTolerance: 60,
+};
+
 beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn());
+  vi.stubEnv("VERCEL_MARKETPLACE_OIDC_ISSUER", VERCEL_ISSUER);
+  vi.stubEnv("VERCEL_MARKETPLACE_OIDC_AUDIENCE", VERCEL_AUDIENCE);
 });
 
 afterEach(() => {
+  if (originalOAuthAuthServerUrl === undefined) {
+    delete process.env.OAUTH_AUTH_SERVER_URL;
+  } else {
+    process.env.OAUTH_AUTH_SERVER_URL = originalOAuthAuthServerUrl;
+  }
+  if (originalOAuthJwksUrl === undefined) {
+    delete process.env.OAUTH_JWKS_URL;
+  } else {
+    process.env.OAUTH_JWKS_URL = originalOAuthJwksUrl;
+  }
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.clearAllMocks();
 });
 
@@ -166,17 +193,19 @@ describe("validateJWT - Entra path", () => {
 });
 
 describe("validateJWT - Clerk path", () => {
-  test("verifies against Clerk JWKS for non-Entra issuers", async () => {
+  test("verifies a Clerk access token against the Clerk JWKS without any fetch", async () => {
     vi.mocked(jose.jwtVerify).mockResolvedValue({
-      payload: {},
-      protectedHeader: { alg: "RS256" },
+      payload: { aud: "https://mcp.context7.com/mcp" },
+      protectedHeader: { alg: "RS256", typ: "at+jwt" },
     } as unknown as Awaited<ReturnType<typeof jose.jwtVerify>>);
 
     const { validateJWT } = await loadModule();
-    const result = await validateJWT(makeEntraToken({ iss: "https://clerk.context7.com" }));
+    const token = makeClerkToken({ iss: "https://clerk.context7.com" });
+    const result = await validateJWT(token);
 
-    expect(result.valid).toBe(true);
+    expect(result).toEqual({ valid: true });
     expect(fetch).not.toHaveBeenCalled();
+    expect(jose.jwtVerify).toHaveBeenCalledWith(token, "fake-jwks", CLERK_VERIFY_OPTIONS);
   });
 
   test("returns 'Token expired' when jwtVerify throws JWTExpired", async () => {
@@ -185,9 +214,146 @@ describe("validateJWT - Clerk path", () => {
     );
 
     const { validateJWT } = await loadModule();
-    const result = await validateJWT(makeEntraToken({ iss: "https://clerk.context7.com" }));
+    const result = await validateJWT(makeClerkToken({ iss: "https://clerk.context7.com" }));
 
     expect(result.valid).toBe(false);
     expect(result.error).toBe("Token expired");
+  });
+
+  test("rejects Clerk ID tokens and session JWTs before any key lookup", async () => {
+    const { validateJWT } = await loadModule();
+
+    for (const typ of ["JWT", "jwt", undefined]) {
+      const result = await validateJWT(makeEntraToken({ iss: "https://clerk.context7.com" }, typ));
+      expect(result).toEqual({ valid: false, error: "Not an OAuth access token" });
+    }
+    expect(jose.jwtVerify).not.toHaveBeenCalled();
+  });
+
+  test("rejects JWTs from an untrusted issuer without a key lookup", async () => {
+    const { validateJWT } = await loadModule();
+
+    await expect(validateJWT(makeClerkToken({ iss: "https://evil.example" }))).resolves.toEqual({
+      valid: false,
+      error: "Untrusted issuer",
+    });
+    await expect(validateJWT(makeClerkToken({}))).resolves.toEqual({
+      valid: false,
+      error: "Untrusted issuer",
+    });
+    expect(jose.jwtVerify).not.toHaveBeenCalled();
+  });
+
+  test("uses the configured OAuth issuer and its JWKS for verification", async () => {
+    process.env.OAUTH_AUTH_SERVER_URL = "https://supreme-foal-19.clerk.accounts.dev/";
+    vi.mocked(jose.jwtVerify).mockResolvedValue({
+      payload: { aud: "https://mcp.context7.com/mcp" },
+      protectedHeader: { alg: "RS256", typ: "at+jwt" },
+    } as unknown as Awaited<ReturnType<typeof jose.jwtVerify>>);
+
+    const { validateJWT } = await loadModule();
+    const result = await validateJWT(
+      makeClerkToken({ iss: "https://supreme-foal-19.clerk.accounts.dev" })
+    );
+
+    expect(result).toEqual({ valid: true });
+    expect(jose.createRemoteJWKSet).toHaveBeenCalledWith(
+      new URL("https://supreme-foal-19.clerk.accounts.dev/.well-known/jwks.json")
+    );
+    expect(jose.jwtVerify).toHaveBeenCalledWith(expect.any(String), "fake-jwks", {
+      ...CLERK_VERIFY_OPTIONS,
+      issuer: "https://supreme-foal-19.clerk.accounts.dev",
+    });
+  });
+
+  test("allows an explicit JWKS URL without changing the OAuth issuer", async () => {
+    process.env.OAUTH_AUTH_SERVER_URL = "https://oauth.example.com";
+    process.env.OAUTH_JWKS_URL = "https://keys.example.com/oauth/jwks.json";
+
+    await loadModule();
+
+    expect(jose.createRemoteJWKSet).toHaveBeenCalledWith(
+      new URL("https://keys.example.com/oauth/jwks.json")
+    );
+  });
+});
+
+describe("validateJWT - Vercel Marketplace OIDC path", () => {
+  test("verifies the exact issuer, audience, time window, and resource", async () => {
+    vi.mocked(jose.jwtVerify).mockResolvedValue({
+      payload: {
+        resource: "teamspace-resource-123",
+        sub: "user_123",
+        act: "owner:team1:project:p1:environment:production",
+      },
+      protectedHeader: { alg: "RS256" },
+    } as unknown as Awaited<ReturnType<typeof jose.jwtVerify>>);
+
+    const { validateJWT } = await loadModule();
+    const token = makeEntraToken({ iss: VERCEL_ISSUER, aud: VERCEL_AUDIENCE });
+
+    await expect(validateJWT(token)).resolves.toEqual({ valid: true });
+    expect(jose.createRemoteJWKSet).toHaveBeenCalledWith(
+      new URL(`${VERCEL_ISSUER}/.well-known/jwks`)
+    );
+    expect(jose.jwtVerify).toHaveBeenCalledWith(token, "fake-jwks", {
+      algorithms: ["RS256"],
+      audience: VERCEL_AUDIENCE,
+      issuer: VERCEL_ISSUER,
+      clockTolerance: 60,
+    });
+  });
+
+  test("does not trust lookalike Vercel hosts", async () => {
+    const { validateJWT } = await loadModule();
+    const token = makeEntraToken({
+      iss: "https://integrations.vercel.com.attacker.test/oac_123456789",
+    });
+
+    await expect(validateJWT(token)).resolves.toEqual({
+      valid: false,
+      error: "Untrusted issuer",
+    });
+    expect(jose.jwtVerify).not.toHaveBeenCalled();
+  });
+
+  test("rejects tokens from another Vercel integration", async () => {
+    const { validateJWT } = await loadModule();
+    const token = makeEntraToken({ iss: "https://integrations.vercel.com/oac_987654321" });
+
+    await expect(validateJWT(token)).resolves.toEqual({
+      valid: false,
+      error: "Untrusted Vercel Marketplace issuer",
+    });
+    expect(jose.jwtVerify).not.toHaveBeenCalled();
+  });
+
+  test("fails closed when Marketplace OIDC is not configured", async () => {
+    vi.stubEnv("VERCEL_MARKETPLACE_OIDC_ISSUER", "");
+    vi.stubEnv("VERCEL_MARKETPLACE_OIDC_AUDIENCE", "");
+
+    const { validateJWT } = await loadModule();
+    const token = makeEntraToken({ iss: VERCEL_ISSUER });
+
+    await expect(validateJWT(token)).resolves.toEqual({
+      valid: false,
+      error: "Vercel Marketplace OIDC not configured",
+    });
+    expect(jose.jwtVerify).not.toHaveBeenCalled();
+  });
+
+  test("requires Vercel's immutable resource claim", async () => {
+    vi.mocked(jose.jwtVerify).mockResolvedValue({
+      payload: {},
+      protectedHeader: { alg: "RS256" },
+    } as unknown as Awaited<ReturnType<typeof jose.jwtVerify>>);
+
+    const { validateJWT } = await loadModule();
+    const token = makeEntraToken({ iss: VERCEL_ISSUER, aud: VERCEL_AUDIENCE });
+
+    await expect(validateJWT(token)).resolves.toEqual({
+      valid: false,
+      error: "Missing Vercel Marketplace resource",
+    });
   });
 });
