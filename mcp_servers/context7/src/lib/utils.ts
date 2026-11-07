@@ -1,3 +1,4 @@
+import { CLIENT_INFO_META_KEY } from "@modelcontextprotocol/server";
 import { SearchResponse, SearchResult } from "./types.js";
 
 /**
@@ -64,10 +65,6 @@ export function formatSearchResult(result: SearchResult): string {
  * @returns A formatted string with search results
  */
 export function formatSearchResults(searchResponse: SearchResponse): string {
-  if (!searchResponse.results || searchResponse.results.length === 0) {
-    return "No documentation libraries found matching your query.";
-  }
-
   const parts: string[] = [];
 
   if (searchResponse.searchFilterApplied) {
@@ -76,10 +73,32 @@ export function formatSearchResults(searchResponse: SearchResponse): string {
     );
   }
 
-  const formattedResults = searchResponse.results.map(formatSearchResult);
-  parts.push(formattedResults.join("\n----------\n"));
+  if (!searchResponse.results || searchResponse.results.length === 0) {
+    parts.push("No documentation libraries found matching your query.");
+  } else {
+    const formattedResults = searchResponse.results.map(formatSearchResult);
+    parts.push(formattedResults.join("\n----------\n"));
+  }
 
   return parts.join("\n\n");
+}
+
+/**
+ * Reads the client name/version that modern (2026-07-28) clients attach to
+ * every request's `_meta` envelope. Legacy (2025) clients declare it once in
+ * the initialize handshake instead.
+ *
+ * The envelope is untyped (`RequestMetaEnvelope = {}`) as of SDK 2.0.0, so
+ * the shape probed here is not compile-checked against the SDK —
+ * utils.test.ts locks it so an SDK bump that changes it fails loudly.
+ */
+export function envelopeClientInfo(
+  envelope: unknown
+): { ide?: string; version?: string } | undefined {
+  const info = (envelope as Record<string, { name?: string; version?: string }> | undefined)?.[
+    CLIENT_INFO_META_KEY
+  ];
+  return info ? { ide: info.name, version: info.version } : undefined;
 }
 
 /**
