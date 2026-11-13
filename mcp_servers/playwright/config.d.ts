@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import type * as playwright from '../../..';
+import type * as playwright from 'playwright';
 
 export type ToolCapability =
   'config' |
@@ -48,6 +48,7 @@ export type Config = {
     /**
      * Path to a user data directory for browser profile persistence.
      * Temporary directory is created by default.
+     * Relative paths are resolved against the config file's directory.
      */
     userDataDir?: string;
 
@@ -56,6 +57,7 @@ export type Config = {
      * @see https://playwright.dev/docs/api/class-browsertype#browser-type-launch-persistent-context
      *
      * This is useful for settings options like `channel`, `headless`, `executablePath`, etc.
+     * Relative paths are resolved against the config file's directory.
      */
     launchOptions?: playwright.LaunchOptions;
 
@@ -63,6 +65,7 @@ export type Config = {
      * Context options for the browser context.
      *
      * This is useful for settings options like `viewport`.
+     * Relative paths are resolved against the config file's directory.
      */
     contextOptions?: playwright.BrowserContextOptions;
 
@@ -92,12 +95,14 @@ export type Config = {
 
     /**
      * Paths to TypeScript files to add as initialization scripts for Playwright page.
+     * Relative paths are resolved against the config file's directory.
      */
     initPage?: string[];
 
     /**
      * Paths to JavaScript files to add as initialization scripts.
      * The scripts will be evaluated in every page before any of the page's scripts.
+     * Relative paths are resolved against the config file's directory.
      */
     initScript?: string[];
   },
@@ -108,6 +113,17 @@ export type Config = {
    * Requires the "Playwright Extension" to be installed.
    */
   extension?: boolean;
+
+  /**
+   * Group controlled tabs when using the extension. Defaults to true.
+   */
+  tabGroup?: boolean;
+
+  /**
+   * Do not activate controlled tabs or focus the browser window when using the extension.
+   * Defaults to false.
+   */
+  background?: boolean;
 
   server?: {
     /**
@@ -121,7 +137,7 @@ export type Config = {
     host?: string;
 
     /**
-     * The hosts this server is allowed to serve from. Defaults to the host server is bound to.
+     * The hosts this server is allowed to serve from. Defaults to localhost, loopback IPs and the host passed via --host; other hosts must be listed explicitly.
      * This is not for CORS, but rather for the DNS rebinding protection.
      */
     allowedHosts?: string[];
@@ -142,6 +158,12 @@ export type Config = {
   saveSession?: boolean;
 
   /**
+   * Whether to collect and expose the tools that a page registers through the
+   * experimental WebMCP API. Enabled by default.
+   */
+  webmcp?: boolean;
+
+  /**
    * Reuse the same browser context between all connected HTTP clients.
    */
   sharedBrowserContext?: boolean;
@@ -154,7 +176,18 @@ export type Config = {
   secrets?: Record<string, string>;
 
   /**
-   * The directory to save output files.
+   * Names of URL query and fragment parameters, for example `access_token` or `code`, whose values
+   * are replaced with `<redacted>` in the tool responses. Use it for session and grant values that
+   * are minted at runtime and cannot be listed in `secrets`. Like `secrets`, it is a convenience
+   * and not a security feature.
+   */
+  redactUrlParams?: string[];
+
+  /**
+   * The directory for automatically named output files, for example a screenshot taken without an
+   * explicit file name. Files with an explicit name are resolved against the workspace root instead
+   * and are not affected by this option.
+   * Relative paths are resolved against the config file's directory.
    */
   outputDir?: string;
 
@@ -210,18 +243,42 @@ export type Config = {
      * Configures default expect timeout: https://playwright.dev/docs/test-timeouts#expect-timeout. Defaults to 5000ms.
      */
     expect?: number;
+
+    /**
+     * How long to wait after each action for triggered work (navigations, requests) to settle before responding. Defaults to 500ms.
+     */
+    settle?: number;
+
+    /**
+     * Close the browser after this many milliseconds without a tool call, and relaunch it on the next one.
+     * Defaults to one hour for headless browsers Playwright launched, and to no timeout for headed or attached ones. Pass 0 to disable.
+     * The CLI shuts the whole session down instead of relaunching.
+     */
+    idle?: number;
   };
 
   /**
-   * Whether to send image responses to the client. Can be "allow", "omit", or "auto". Defaults to "auto", which sends images if the client can display them.
+   * Whether to send image responses to the client. Can be "allow", "omit", or "only". Defaults to "allow".
+   * With "only", a response that carries an image consists of the image parts alone, without the text part.
    */
-  imageResponses?: 'allow' | 'omit';
+  imageResponses?: 'allow' | 'omit' | 'only';
+
+  /**
+   * How file paths are rendered in tool results. Can be "relative" to the workspace root or "absolute". Defaults to "relative".
+   */
+  filePaths?: 'relative' | 'absolute';
 
   snapshot?: {
     /**
      * When taking snapshots for responses, specifies the mode to use.
      */
     mode?: 'full' | 'none';
+
+    /**
+     * Whether to include each element's bounding box as [box=x,y,width,height] in snapshots.
+     * Coordinates are viewport-relative, in CSS pixels (Element.getBoundingClientRect).
+     */
+    boxes?: boolean;
   };
 
   /**
@@ -233,7 +290,14 @@ export type Config = {
   allowUnrestrictedFileAccess?: boolean;
 
   /**
+   * Do not ask the client for its workspace roots, use the current working directory
+   * as the workspace root instead. Use this with clients that advertise roots, but
+   * can not answer the roots request.
+   */
+  ignoreRoots?: boolean;
+
+  /**
    * Specify the language to use for code generation.
    */
-  codegen?: 'typescript' | 'none';
+  codegen?: 'typescript' | 'python' | 'java' | 'csharp' | 'none';
 };

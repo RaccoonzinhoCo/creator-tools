@@ -1,3 +1,4 @@
+import { CLIENT_INFO_META_KEY } from "@modelcontextprotocol/server";
 import { SearchResponse, SearchResult } from "./types.js";
 
 /**
@@ -15,13 +16,29 @@ function getSourceReputationLabel(
 }
 
 /**
+ * Libraries built from a Git repository have source that query-code can search.
+ * This is a client-side guess from the ID and the branch: the server decides
+ * with sourceRepo() in its /api/v2/code route and answers 422 "no_source".
+ * Keep the rule the same as hasSourceCode in packages/cli/src/utils/api.ts.
+ */
+export function hasSourceCode(result: Pick<SearchResult, "id" | "branch">): boolean {
+  return !/^\/(websites|llmstxt)\//.test(result.id) && !result.branch?.startsWith("_");
+}
+
+/** Options for formatSearchResult and formatSearchResults. */
+export interface FormatOptions {
+  /** Mark the results whose source code query-code can search. */
+  sourceCode?: boolean;
+}
+
+/**
  * Formats a search result into a human-readable string representation.
  * Only shows code snippet count and GitHub stars when available (not equal to -1).
  *
  * @param result The SearchResult object to format
  * @returns A formatted string with library information
  */
-export function formatSearchResult(result: SearchResult): string {
+export function formatSearchResult(result: SearchResult, options: FormatOptions = {}): string {
   // Always include these basic details
   const formattedResult = [
     `- Title: ${result.title}`,
@@ -52,6 +69,10 @@ export function formatSearchResult(result: SearchResult): string {
     formattedResult.push(`- Source: ${result.source}`);
   }
 
+  if (options.sourceCode && hasSourceCode(result)) {
+    formattedResult.push(`- Source code: searchable with query-code`);
+  }
+
   // Join all parts with newlines
   return formattedResult.join("\n");
 }
@@ -63,11 +84,10 @@ export function formatSearchResult(result: SearchResult): string {
  * @param searchResponse The SearchResponse object to format
  * @returns A formatted string with search results
  */
-export function formatSearchResults(searchResponse: SearchResponse): string {
-  if (!searchResponse.results || searchResponse.results.length === 0) {
-    return "No documentation libraries found matching your query.";
-  }
-
+export function formatSearchResults(
+  searchResponse: SearchResponse,
+  options: FormatOptions = {}
+): string {
   const parts: string[] = [];
 
   if (searchResponse.searchFilterApplied) {
@@ -76,10 +96,34 @@ export function formatSearchResults(searchResponse: SearchResponse): string {
     );
   }
 
-  const formattedResults = searchResponse.results.map(formatSearchResult);
-  parts.push(formattedResults.join("\n----------\n"));
+  if (!searchResponse.results || searchResponse.results.length === 0) {
+    parts.push("No documentation libraries found matching your query.");
+  } else {
+    const formattedResults = searchResponse.results.map((result) =>
+      formatSearchResult(result, options)
+    );
+    parts.push(formattedResults.join("\n----------\n"));
+  }
 
   return parts.join("\n\n");
+}
+
+/**
+ * Reads the client name/version that modern (2026-07-28) clients attach to
+ * every request's `_meta` envelope. Legacy (2025) clients declare it once in
+ * the initialize handshake instead.
+ *
+ * The envelope is untyped (`RequestMetaEnvelope = {}`) as of SDK 2.0.0, so
+ * the shape probed here is not compile-checked against the SDK —
+ * utils.test.ts locks it so an SDK bump that changes it fails loudly.
+ */
+export function envelopeClientInfo(
+  envelope: unknown
+): { ide?: string; version?: string } | undefined {
+  const info = (envelope as Record<string, { name?: string; version?: string }> | undefined)?.[
+    CLIENT_INFO_META_KEY
+  ];
+  return info ? { ide: info.name, version: info.version } : undefined;
 }
 
 /**
