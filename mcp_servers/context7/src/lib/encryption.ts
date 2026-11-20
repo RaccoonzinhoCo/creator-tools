@@ -1,32 +1,74 @@
 import { createCipheriv, randomBytes } from "crypto";
+import { isIP } from "node:net";
 import { SERVER_VERSION } from "./constants.js";
+import { CODE_TOOLS } from "./tool-names.js";
 import type { ClientContext } from "./types.js";
 
-const DEFAULT_ENCRYPTION_KEY = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-const ENCRYPTION_KEY = process.env.CLIENT_IP_ENCRYPTION_KEY || DEFAULT_ENCRYPTION_KEY;
-const ALGORITHM = "aes-256-cbc";
+const ASSERTION_ALGORITHM = "aes-256-gcm";
+const ASSERTION_VERSION = "v1";
+let reportedInvalidAssertionKey = false;
 
 function validateEncryptionKey(key: string): boolean {
   // Must be exactly 64 hex characters (32 bytes)
   return /^[0-9a-fA-F]{64}$/.test(key);
 }
 
-function encryptClientIp(clientIp: string): string {
-  if (!validateEncryptionKey(ENCRYPTION_KEY)) {
-    console.error("Invalid encryption key format. Must be 64 hex characters.");
-    return clientIp; // Fallback to unencrypted
-  }
+function assertionKey() {
+  const key = process.env.MCP_CLIENT_IP_ASSERTION_KEY;
+  return key && validateEncryptionKey(key) ? Buffer.from(key, "hex") : null;
+}
 
+/** Whether this process holds the key the app shares with the hosted MCP server. */
+export function hasMcpAssertionKey(): boolean {
+  return assertionKey() !== null;
+}
+
+/**
+ * Seal `plaintext` as a short-lived assertion the app opens with `openMcpAssertion(tag, …)`.
+ * Format: <tag>:<unix timestamp seconds>:<12-byte nonce hex>:<ciphertext + tag hex>. The tag
+ * and timestamp are authenticated data, so one kind of assertion cannot pass as another.
+ */
+export function sealMcpAssertion(
+  tag: string,
+  plaintext: string,
+  nowMs = Date.now(),
+  nonce = randomBytes(12)
+): string | null {
+  const key = assertionKey();
+  if (!key || nonce.length !== 12) return null;
   try {
-    const iv = randomBytes(16);
-    const cipher = createCipheriv(ALGORITHM, Buffer.from(ENCRYPTION_KEY, "hex"), iv);
-    let encrypted = cipher.update(clientIp, "utf8", "hex");
-    encrypted += cipher.final("hex");
-    return iv.toString("hex") + ":" + encrypted;
-  } catch (error) {
-    console.error("Error encrypting client IP:", error);
-    return clientIp; // Fallback to unencrypted
+    const timestamp = Math.floor(nowMs / 1000).toString();
+    const aad = `${tag}:${timestamp}`;
+    const cipher = createCipheriv(ASSERTION_ALGORITHM, key, nonce);
+    cipher.setAAD(Buffer.from(aad, "utf8"));
+    const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    const ciphertextAndTag = Buffer.concat([ciphertext, cipher.getAuthTag()]);
+    return `${aad}:${nonce.toString("hex")}:${ciphertextAndTag.toString("hex")}`;
+  } catch {
+    return null;
   }
+}
+
+/**
+ * Create a short-lived, authenticated client-IP assertion.
+ * Format: v1:<unix timestamp seconds>:<12-byte nonce hex>:<ciphertext + tag hex>
+ */
+export function createClientIpAssertion(
+  clientIp: string,
+  nowMs = Date.now(),
+  nonce = randomBytes(12)
+): string | null {
+  if (!assertionKey()) {
+    if (!reportedInvalidAssertionKey) {
+      reportedInvalidAssertionKey = true;
+      console.error(
+        "MCP_CLIENT_IP_ASSERTION_KEY is missing or invalid; client IP assertions are disabled."
+      );
+    }
+    return null;
+  }
+  if (isIP(clientIp) === 0) return null;
+  return sealMcpAssertion(ASSERTION_VERSION, clientIp, nowMs, nonce);
 }
 
 /**
@@ -40,7 +82,8 @@ export function generateHeaders(context: ClientContext): Record<string, string> 
   };
 
   if (context.clientIp) {
-    headers["mcp-client-ip"] = encryptClientIp(context.clientIp);
+    const assertion = createClientIpAssertion(context.clientIp);
+    if (assertion) headers["mcp-client-ip-assertion"] = assertion;
   }
   if (context.sessionId) {
     headers["mcp-session-id"] = context.sessionId;
@@ -54,8 +97,18 @@ export function generateHeaders(context: ClientContext): Record<string, string> 
   if (context.clientInfo?.version) {
     headers["X-Context7-Client-Version"] = context.clientInfo.version;
   }
+  if (context.plugin) {
+    headers["X-Context7-Plugin"] = context.plugin;
+  }
   if (context.transport) {
     headers["X-Context7-Transport"] = context.transport;
+  }
+  if (context.experimentalTools?.length) {
+    headers["X-Context7-Experimental"] = "1";
+  }
+  // Tells the app the agent has the code tools, so a query-docs answer can point at them.
+  if (context.experimentalTools?.includes(CODE_TOOLS)) {
+    headers["X-Context7-Code-Tools"] = "1";
   }
 
   return headers;
