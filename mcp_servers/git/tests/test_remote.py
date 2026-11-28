@@ -1,0 +1,328 @@
+"""Tests for git_remote (#1611): listing remotes without leaking credentials.
+
+The tool's output goes to the model, and a remote URL can carry a credential
+(`https://user:token@host/...`), so most of these pin `redact_url`'s rule: the
+whole userinfo is redacted except an SSH username, which names an account and
+authenticates nothing, and so are query values and the fragment (#5508). The protocol tests drive the real server through
+`conftest.connect`; the unit tests cover URL shapes git would not let a test
+configure as easily.
+"""
+
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import git
+import pytest
+from conftest import connect, make_repo, text_result, tool_error, wire
+
+from mcp_server_git import server
+from mcp_server_git.server import git_remote, redact_url
+
+
+async def call_remote(repository: Path | None, repo: git.Repo) -> dict[str, Any]:
+    assert repo.working_dir is not None
+    async with connect(repository) as session:
+        return wire(
+            await session.call_tool("git_remote", {"repo_path": repo.working_dir})
+        )
+
+
+async def test_no_remotes(repo: git.Repo):
+    assert await call_remote(None, repo) == text_result("No remotes configured")
+
+
+async def test_lists_fetch_and_push_urls(repo: git.Repo):
+    repo.create_remote("origin", "https://example.com/org/repo.git")
+    repo.create_remote("upstream", "git@github.com:org/repo.git")
+    repo.git.remote("set-url", "--push", "upstream", "/srv/mirror.git")
+    assert await call_remote(None, repo) == text_result(
+        "origin\thttps://example.com/org/repo.git (fetch)\n"
+        "origin\thttps://example.com/org/repo.git (push)\n"
+        "upstream\tgit@github.com:org/repo.git (fetch)\n"
+        "upstream\t/srv/mirror.git (push)"
+    )
+
+
+async def test_credentials_are_redacted_over_the_wire(repo: git.Repo):
+    repo.create_remote("origin", "https://user:s3cret-token@example.com/org/repo.git")
+    repo.create_remote("fork", "https://ghp_abc123@github.com/me/repo.git")
+    repo.git.remote("set-url", "--push", "fork", "ssh://git:hunter2@example.com/r")
+    result = await call_remote(None, repo)
+    assert result == text_result(
+        "fork\thttps://<redacted>@github.com/me/repo.git (fetch)\n"
+        "fork\tssh://git:<redacted>@example.com/r (push)\n"
+        "origin\thttps://<redacted>@example.com/org/repo.git (fetch)\n"
+        "origin\thttps://<redacted>@example.com/org/repo.git (push)"
+    )
+    text = result["content"][0]["text"]
+    for secret in ("s3cret-token", "ghp_abc123", "hunter2"):
+        assert secret not in text
+
+
+async def test_respects_repository_confinement(tmp_path: Path, repo: git.Repo):
+    # --repository must name a real repository, or serve() exits before the
+    # client connects.
+    allowed_repo = make_repo(tmp_path / "allowed")
+    allowed_repo.close()
+    allowed = (tmp_path / "allowed").resolve()
+    assert await call_remote(allowed, repo) == tool_error(
+        "git_remote",
+        f"Repository path '{repo.working_dir}' is outside the allowed repository "
+        f"'{allowed}'",
+    )
+
+
+async def test_not_a_repository(tmp_path: Path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    async with connect(None) as session:
+        result = wire(await session.call_tool("git_remote", {"repo_path": str(plain)}))
+    assert result == tool_error("git_remote", str(plain))
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # HTTP(S): a token is as often the username as the password.
+        (
+            "https://user:token@example.com/r.git",
+            "https://<redacted>@example.com/r.git",
+        ),
+        ("https://token@example.com/r.git", "https://<redacted>@example.com/r.git"),
+        ("http://u:p@example.com:8080/r", "http://<redacted>@example.com:8080/r"),
+        ("HTTPS://u:p@example.com/r", "HTTPS://<redacted>@example.com/r"),
+        # Any other scheme with userinfo is treated the same way.
+        ("ftps://u:p@example.com/r", "ftps://<redacted>@example.com/r"),
+        # A password holding an unescaped '@': the userinfo runs to the last
+        # '@' before the first '/', so none of it survives.
+        ("https://u:p@ss@example.com/r", "https://<redacted>@example.com/r"),
+        # No path at all.
+        ("https://u:p@example.com", "https://<redacted>@example.com"),
+        # SSH: the username stays, a password does not.
+        ("ssh://git@example.com/r.git", "ssh://git@example.com/r.git"),
+        ("ssh://git:pw@example.com/r.git", "ssh://git:<redacted>@example.com/r.git"),
+        ("git+ssh://me:pw@example.com/r", "git+ssh://me:<redacted>@example.com/r"),
+        ("SSH+GIT://me@example.com/r", "SSH+GIT://me@example.com/r"),
+        # No userinfo: unchanged.
+        ("https://example.com/r.git", "https://example.com/r.git"),
+        ("https://example.com/path@x/r.git", "https://example.com/path@x/r.git"),
+        ("git@github.com:org/r.git", "git@github.com:org/r.git"),
+        ("/srv/repos/r.git", "/srv/repos/r.git"),
+        ("file:///srv/repos/r.git", "file:///srv/repos/r.git"),
+        # A remote-helper address: the URL after `::` is redacted as a URL.
+        (
+            "https::https://alice:token@example.com/r.git",
+            "https::https://<redacted>@example.com/r.git",
+        ),
+        ("ext::ssh://git:pw@example.com/r", "ext::ssh://git:<redacted>@example.com/r"),
+        ("https::https://example.com/r.git", "https::https://example.com/r.git"),
+        # Query values and the fragment (#5508): every value, whatever its
+        # parameter's name, with the names kept; a bare parameter whole.
+        (
+            "https://git.example.com/g/r.git?private_token=SECRET",
+            "https://git.example.com/g/r.git?private_token=<redacted>",
+        ),
+        (
+            "https://example.com/r?a=1&token=SECRET&&flag",
+            "https://example.com/r?a=<redacted>&token=<redacted>&&<redacted>",
+        ),
+        ("https://example.com/r?SECRET", "https://example.com/r?<redacted>"),
+        ("https://example.com/r?", "https://example.com/r?"),
+        (
+            "https://git.example.com/g/r.git#SECRET",
+            "https://git.example.com/g/r.git#<redacted>",
+        ),
+        ("https://example.com/r#", "https://example.com/r#"),
+        # The fragment starts at the first '#', which also ends the query.
+        ("https://example.com/r#a?b=c", "https://example.com/r#<redacted>"),
+        (
+            "https://example.com/r?a=b#c",
+            "https://example.com/r?a=<redacted>#<redacted>",
+        ),
+        # Userinfo, query and fragment together; an '@' inside a query value.
+        (
+            "https://u:p@example.com/r?t=x#y",
+            "https://<redacted>@example.com/r?t=<redacted>#<redacted>",
+        ),
+        ("https://example.com/r?e=a@b.com", "https://example.com/r?e=<redacted>"),
+        ("ssh://git@example.com/r?t=x", "ssh://git@example.com/r?t=<redacted>"),
+        # A '?' or '#' before the userinfo's '@' may be in a password or may
+        # start a query or fragment holding an '@': nothing after the scheme
+        # can be shown safely.
+        ("https://user:p?ss@example.com", "https://<redacted>"),
+        ("https://user:p#ss@example.com", "https://<redacted>"),
+        ("https://example.com?token=left@SECRET", "https://<redacted>"),
+        ("https://example.com#left@SECRET", "https://<redacted>"),
+        ("ssh://example.com?token=left@SECRET", "ssh://<redacted>"),
+        ("https://example.com?t=a@SECRET/x", "https://<redacted>"),
+        ("https://u:p?ss@example.com/r", "https://<redacted>"),
+        ("https://example.com?t=SECRET", "https://example.com?t=<redacted>"),
+        # A remote-helper address: the inner URL's query is redacted.
+        (
+            "https::https://example.com/r?t=SECRET",
+            "https::https://example.com/r?t=<redacted>",
+        ),
+        # A path segment cannot be told apart from a repository name: kept.
+        (
+            "https://git.example.com/token/SECRET/r.git",
+            "https://git.example.com/token/SECRET/r.git",
+        ),
+        # A file:// URL names a local file, whose name may hold '?' or '#'.
+        ("file:///srv/r?x#y.git", "file:///srv/r?x#y.git"),
+        ("file://u:p@host/srv/r?x", "file://<redacted>@host/srv/r?x"),
+        # A password holding a line separator other than '\n'.
+        ("https://u:s3cret\u2028tok@example.com/r", "https://<redacted>@example.com/r"),
+        # A value holding a URL that does not start it cannot be split safely,
+        # so it is withheld whole.
+        (" https://bob:token@example.com/r.git", "<redacted>"),
+        ("d\thttps://alice:token@example.com/r.git", "<redacted>"),
+        ("x https://example.com/r.git", "<redacted>"),
+        ("https:: https://alice:token@example.com/r", "https::<redacted>"),
+    ],
+)
+def test_redact_url(url: str, expected: str):
+    assert redact_url(url) == expected
+
+
+def test_unparseable_line_is_withheld(repo: git.Repo):
+    # `git remote -v` always prints `<name>\t<url> (<direction>)`. A line in
+    # any other shape (a URL holding a raw newline is split across two) cannot
+    # be parsed, so none of it is returned.
+    outputs = {
+        ("remote",): "origin\nup\n",
+        ("remote", "-v"): (
+            "origin\thttps://u:pa\nss@example.com/r (fetch)\n"
+            "origin\tno-direction\n"
+            "up\thttps://example.com/r (push)\n"
+        ),
+    }
+    with mock.patch.object(
+        server, "_git_text", side_effect=lambda _repo, *args: outputs[args]
+    ):
+        assert git_remote(repo) == (
+            "<redacted>\n<redacted>\n<redacted>\nup\thttps://example.com/r (push)"
+        )
+
+
+async def test_line_separator_in_password_is_not_split(repo: git.Repo):
+    # str.splitlines() would cut this URL at U+2028 and leak both halves of
+    # the password (Copilot review on #5373).
+    repo.create_remote("origin", "https://alice:s3cret\u2028token@example.com/r.git")
+    result = await call_remote(None, repo)
+    assert result == text_result(
+        "origin\thttps://<redacted>@example.com/r.git (fetch)\n"
+        "origin\thttps://<redacted>@example.com/r.git (push)"
+    )
+    assert "s3cret" not in result["content"][0]["text"]
+    assert "token" not in result["content"][0]["text"]
+
+
+async def test_partial_clone_filter_is_kept(repo: git.Repo):
+    # A promisor remote's fetch line ends in its filter (Copilot review on
+    # #5373); the line still parses, and only the URL is redacted.
+    repo.create_remote("origin", "https://alice:token@example.com/r.git")
+    with repo.config_writer() as config:
+        config.set_value('remote "origin"', "promisor", "true")
+        config.set_value('remote "origin"', "partialclonefilter", "blob:none")
+    assert await call_remote(None, repo) == text_result(
+        "origin\thttps://<redacted>@example.com/r.git (fetch) [blob:none]\n"
+        "origin\thttps://<redacted>@example.com/r.git (push)"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["remote.origin.url", "remote.origin.pushurl", "url.https://x/.insteadOf"],
+)
+async def test_newline_in_a_url_refuses_to_list(repo: git.Repo, key: str):
+    # Copilot review on #5373: with a newline after ` (fetch)`, the fragment
+    # before it reads as a whole line with no '@', so a line parser would
+    # return `https://alice:SECRET` unredacted.
+    repo.create_remote("origin", "https://example.com/r.git")
+    repo.git.config(key, "https://alice:SECRET (fetch)\nrest@example.com/r.git")
+    result = await call_remote(None, repo)
+    assert result == tool_error(
+        "git_remote",
+        "A configured remote URL contains a newline, so the remotes cannot be "
+        "listed without risking a credential in it; git refuses such URLs as well",
+    )
+    assert "SECRET" not in result["content"][0]["text"]
+
+
+async def test_remote_helper_url_is_redacted(repo: git.Repo):
+    repo.git.remote("add", "origin", "https::https://alice:token@example.com/r.git")
+    assert await call_remote(None, repo) == text_result(
+        "origin\thttps::https://<redacted>@example.com/r.git (fetch)\n"
+        "origin\thttps::https://<redacted>@example.com/r.git (push)"
+    )
+
+
+async def test_query_and_fragment_credentials_are_redacted_over_the_wire(
+    repo: git.Repo,
+):
+    # The issue's examples (#5508): a token in a query value or the fragment.
+    repo.create_remote("origin", "https://git.example.com/g/r.git?private_token=S1")
+    repo.git.remote("set-url", "--push", "origin", "https://git.example.com/g/r.git#S2")
+    result = await call_remote(None, repo)
+    assert result == text_result(
+        "origin\thttps://git.example.com/g/r.git?private_token=<redacted> (fetch)\n"
+        "origin\thttps://git.example.com/g/r.git#<redacted> (push)"
+    )
+
+
+async def test_tab_in_remote_name_keeps_the_url_whole(
+    tmp_path: Path, repo: git.Repo, monkeypatch: pytest.MonkeyPatch
+):
+    # A remote name may hold a tab, which `git remote -v` prints as is before
+    # the tab that ends the name. The name is matched against the configured
+    # names, so the URL after it, rewritten by a credential-bearing `insteadOf`
+    # in the user's global config, is still redacted.
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        '[url "https://alice:HOSTTOKEN@srv.example.com/"]\n'
+        "\tinsteadOf = https://srv.example.com/\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    repo.git.config("remote.c\td.url", "https://srv.example.com/org/r.git")
+    result = await call_remote(None, repo)
+    assert result == text_result(
+        "c\td\thttps://<redacted>@srv.example.com/org/r.git (fetch)\n"
+        "c\td\thttps://<redacted>@srv.example.com/org/r.git (push)"
+    )
+    assert "HOSTTOKEN" not in result["content"][0]["text"]
+
+
+async def test_url_not_starting_with_its_scheme_is_withheld(repo: git.Repo):
+    # A configured value with leading whitespace is printed as is by git; the
+    # URL inside it does not start the value, so it is withheld whole.
+    repo.git.config("remote.lead.url", " https://bob:REPOTOKEN@example.com/r.git")
+    result = await call_remote(None, repo)
+    assert result == text_result("lead\t<redacted> (fetch)\nlead\t<redacted> (push)")
+    assert "REPOTOKEN" not in result["content"][0]["text"]
+
+
+def test_longest_configured_name_is_matched(repo: git.Repo):
+    # With remotes `c` and `c<TAB>d` both configured, a line starting
+    # `c<TAB>d<TAB>` is read as the longer name, and whichever remote it came
+    # from, a URL left holding a tab and another URL is withheld.
+    outputs = {
+        ("remote",): "c\nc\td\n",
+        ("remote", "-v"): (
+            "c\td\thttps://u:p@example.com/r (fetch)\n"
+            "c\td\thttps://u:p@example.com/r (push)\n"
+            "unknown\thttps://u:p@example.com/r (fetch)\n"
+        ),
+    }
+    with (
+        mock.patch.object(server, "_remote_url_has_newline", return_value=False),
+        mock.patch.object(
+            server, "_git_text", side_effect=lambda _repo, *args: outputs[args]
+        ),
+    ):
+        assert git_remote(repo) == (
+            "c\td\thttps://<redacted>@example.com/r (fetch)\n"
+            "c\td\thttps://<redacted>@example.com/r (push)\n"
+            "<redacted>"
+        )

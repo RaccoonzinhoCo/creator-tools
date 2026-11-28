@@ -7,12 +7,15 @@ Published on npm as [`@modelcontextprotocol/server-memory`](https://www.npmjs.co
 ## Core Concepts
 
 ### Entities
+
 Entities are the primary nodes in the knowledge graph. Each entity has:
+
 - A unique name (identifier)
 - An entity type (e.g., "person", "organization", "event")
 - A list of observations
 
 Example:
+
 ```json
 {
   "name": "John_Smith",
@@ -22,9 +25,11 @@ Example:
 ```
 
 ### Relations
+
 Relations define directed connections between entities. They are always stored in active voice and describe how entities interact or relate to each other.
 
 Example:
+
 ```json
 {
   "from": "John_Smith",
@@ -32,7 +37,9 @@ Example:
   "relationType": "works_at"
 }
 ```
+
 ### Observations
+
 Observations are discrete pieces of information about an entity. They are:
 
 - Stored as strings
@@ -41,6 +48,7 @@ Observations are discrete pieces of information about an entity. They are:
 - Should be atomic (one fact per observation)
 
 Example:
+
 ```json
 {
   "entityName": "John_Smith",
@@ -55,6 +63,7 @@ Example:
 ## API
 
 ### Tools
+
 - **create_entities**
   - Create multiple new entities in the knowledge graph
   - Input: `entities` (array of objects)
@@ -62,7 +71,8 @@ Example:
       - `name` (string): Entity identifier
       - `entityType` (string): Type classification
       - `observations` (string[]): Associated observations
-  - Ignores entities with existing names
+  - Ignores entities with existing names (and repeats of a name earlier in the same call); their observations are not added
+  - Returns the created entities. When any were skipped, the structured result also lists their names in `skipped`, and a second text item says which were skipped (use `add_observations` to extend an existing entity)
 
 - **create_relations**
   - Create multiple new relations between entities
@@ -72,6 +82,7 @@ Example:
       - `to` (string): Target entity name
       - `relationType` (string): Relationship type in active voice
   - Skips duplicate relations
+  - Fails if either the source or target entity doesn't exist
 
 - **add_observations**
   - Add new observations to existing entities
@@ -83,10 +94,11 @@ Example:
   - Fails if entity doesn't exist
 
 - **delete_entities**
-  - Remove entities and their relations
+  - Remove whole entities, with all their observations
   - Input: `entityNames` (string[])
-  - Cascading deletion of associated relations
-  - Silent operation if entity doesn't exist
+  - Cascading deletion of every relation that points to or from a deleted entity
+  - To remove a link between two entities and keep both, use `delete_relations`; to remove facts from an entity, use `delete_observations`
+  - No error if an entity doesn't exist; the response reports which names were not found
 
 - **delete_observations**
   - Remove specific observations from entities
@@ -94,30 +106,37 @@ Example:
     - Each object contains:
       - `entityName` (string): Target entity
       - `observations` (string[]): Observations to remove
-  - Silent operation if observation doesn't exist
+  - No error if an observation doesn't exist; the response reports how many were deleted
 
 - **delete_relations**
-  - Remove specific relations from the graph
+  - Remove specific relations from the graph, keeping the entities they connect (to remove an entity itself, use `delete_entities`)
   - Input: `relations` (array of objects)
     - Each object contains:
       - `from` (string): Source entity name
       - `to` (string): Target entity name
       - `relationType` (string): Relationship type
-  - Silent operation if relation doesn't exist
+  - A relation is deleted only when `from`, `to` and `relationType` all match a stored one exactly; read the stored `relationType` with `open_nodes` (or `search_nodes`) first if unsure
+  - No error if a relation doesn't exist; the response reports how many were deleted
 
 - **read_graph**
   - Read the entire knowledge graph
-  - No input required
+  - Optional input:
+    - `entityTypes` (string[], at least one): return only entities of these types, and the relations that touch one of them
+    - `observationLimit` (integer, 0 or more): see below
   - Returns complete graph structure with all entities and relations
+  - With `observationLimit`, each entity carries at most that many observations (the first ones, in the order they were added) and an `observationCount` with its total. `observationLimit: 0` returns names, types and counts only: a cheap overview of a large graph, from which `open_nodes` reads the entities you need in full
 
 - **search_nodes**
   - Search for nodes based on query
-  - Input: `query` (string)
+  - Input: `query` (string, at most 2048 characters; a longer query is rejected)
   - Searches across:
     - Entity names
     - Entity types
     - Observation content
   - Returns matching entities and their relations
+  - Optional input:
+    - `limit` (integer, 1 or more): return at most this many matches (the first, in stored order), with the relations that touch them
+    - `observationLimit` (integer, 0 or more): as for `read_graph`
 
 - **open_nodes**
   - Retrieve specific nodes by name
@@ -126,6 +145,7 @@ Example:
     - Requested entities
     - Relations between requested entities
   - Silently skips non-existent nodes
+  - Optional input: `observationLimit` (integer, 0 or more), as for `read_graph`
 
 ### Resources
 
@@ -134,6 +154,42 @@ Example:
   - MIME type: `application/json`
   - Returns the same shape as `read_graph` (entities and relations)
   - Mutation tools (`create_entities`, `create_relations`, `add_observations`, `delete_entities`, `delete_observations`, `delete_relations`) emit `notifications/resources/updated` for this URI, so subscribed clients see live changes
+  - How a client subscribes depends on its protocol version: a 2026-07-28 client names the URI in the `resourceSubscriptions` of its `subscriptions/listen` request and gets the updates on that stream; a 2025-era client calls `resources/subscribe`
+
+## Protocol versions
+
+The server serves both protocol eras on stdio from the same process. The client's first message picks the era of the connection: a 2026-07-28 client opens with `server/discover` and sends its protocol version, identity and capabilities with each request, and a 2025-era client opens with the `initialize` handshake. The tools and the resource are the same on both.
+
+## Requirements
+
+Node.js 24 or later, when the server runs through `npx` or from source.
+
+# Streamable HTTP
+
+The server talks over stdio by default. With `--transport streamable-http` it
+runs on its own as an HTTP service instead, serving one MCP endpoint, `/mcp`,
+to any number of clients of either protocol era:
+
+```sh
+npx -y @modelcontextprotocol/server-memory --transport streamable-http
+```
+
+It listens on `127.0.0.1:3001` unless `HOST` and `PORT` say otherwise (for
+example `PORT=8080`); `HOST=0.0.0.0` exposes it to every machine that can reach
+this one, so set it deliberately. A request from a browser page on any
+origin but localhost is refused with `403`, and the endpoint sends no CORS
+headers, so it serves clients that are not browser pages. Point a client at the URL, such as
+`http://127.0.0.1:3001/mcp`, instead of giving it a command:
+
+```json
+{
+  "mcpServers": {
+    "memory": { "type": "http", "url": "http://127.0.0.1:3001/mcp" }
+  }
+}
+```
+
+Over HTTP each request is served by a fresh server, and a 2025-era client gets no session (GET and DELETE on `/mcp` answer `405`), so the server cannot send it requests or notifications between its own requests. The graph lives in its file, so nothing is lost between requests. A 2026-07-28 client that names `memory://knowledge-graph` in its `subscriptions/listen` filter is told of every change any client makes; `resources/subscribe` from a 2025-era client lasts only for its own request, so over HTTP it hears of none.
 
 # Usage with Claude Desktop
 
@@ -148,22 +204,27 @@ Add this to your claude_desktop_config.json:
   "mcpServers": {
     "memory": {
       "command": "docker",
-      "args": ["run", "-i", "-v", "claude-memory:/app/dist", "--rm", "mcp/memory"]
+      "args": [
+        "run",
+        "-i",
+        "-v",
+        "claude-memory:/app/dist",
+        "--rm",
+        "mcp/memory"
+      ]
     }
   }
 }
 ```
 
 #### NPX
+
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ]
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
     }
   }
 }
@@ -176,12 +237,7 @@ On Windows, use `cmd /c` to launch `npx`:
   "mcpServers": {
     "memory": {
       "command": "cmd",
-      "args": [
-        "/c",
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ]
+      "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-memory"]
     }
   }
 }
@@ -196,10 +252,7 @@ The server can be configured using the following environment variables:
   "mcpServers": {
     "memory": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ],
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
       "env": {
         "MEMORY_FILE_PATH": "/path/to/custom/memory.jsonl"
       }
@@ -215,12 +268,7 @@ On Windows, use:
   "mcpServers": {
     "memory": {
       "command": "cmd",
-      "args": [
-        "/c",
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ],
+      "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-memory"],
       "env": {
         "MEMORY_FILE_PATH": "/path/to/custom/memory.jsonl"
       }
@@ -229,7 +277,46 @@ On Windows, use:
 }
 ```
 
-- `MEMORY_FILE_PATH`: Path to the memory storage JSONL file (default: `memory.jsonl` in the server directory)
+- `MEMORY_FILE_PATH`: Path to the memory storage JSONL file (default: `memory.jsonl` in the server directory). A leading `~` expands to your home directory; a relative path resolves against the server directory. Set it to an absolute path you own; see [Choosing where the graph is stored](#choosing-where-the-graph-is-stored).
+- `MEMORY_MAX_ENTITIES`: The most entities the graph may hold. Unset by default (no limit).
+- `MEMORY_MAX_RELATIONS`: The most relations the graph may hold. Unset by default (no limit).
+- `MEMORY_MAX_FILE_BYTES`: The most bytes the memory file may hold. Unset by default (no limit).
+
+The three limits are opt-in, and each is described under [Limiting how large the graph grows](#limiting-how-large-the-graph-grows). A variable that is set must hold a positive whole number; any other value, an empty one included, stops the server at startup with an error naming the variable.
+
+When `MEMORY_FILE_PATH` is not set and the server directory still holds a legacy `memory.json` but no `memory.jsonl`, the server renames `memory.json` to `memory.jsonl` at startup. If that rename fails, the server exits with an error naming both paths and the cause, rather than starting on an empty graph; fix the cause (a permission problem, say) and restart, or set `MEMORY_FILE_PATH` to choose a file explicitly.
+
+#### Choosing where the graph is stored
+
+**Set `MEMORY_FILE_PATH` to an absolute path you own**, such as `~/memory.jsonl`, as in the configuration above. The default `memory.jsonl` sits in the server's own directory, next to its code. Under `npx` or an npm install, that directory is inside a `node_modules` tree, which npm manages as its own: reinstalling or updating the server, or clearing the npx cache, can delete the file and the knowledge graph in it. A relative `MEMORY_FILE_PATH` resolves against that same directory, so it has the same problem.
+
+- When the memory file it resolves is inside a `node_modules` directory, the server prints a warning on stderr at startup naming the file; most clients show a server's stderr in its log. Move the file to the new path when you set the variable, or the server starts on an empty graph.
+- The directory must already exist: the server creates the memory file, not the directories above it.
+- The default stays where it is so that existing graphs keep loading. The [Docker](#docker) setup above keeps it in a named volume mounted over `/app/dist`, so the graph there survives restarts and draws no warning.
+
+Saves are atomic. Every write tool writes the whole graph to a temporary file in the same directory and renames it over the memory file, so a server stopped or killed mid-save leaves the previous graph intact rather than a half-written file. The file's permission bits are kept across the rename. The temporary file is always newly created by the save. Writes from several processes are serialized by a lock, described next.
+
+#### Sharing one memory file between clients
+
+Each MCP client starts its own server process, so two clients using the same `MEMORY_FILE_PATH` (or both using the default) are two processes writing one file. Every write tool takes an exclusive lock file, `<memory file>.lock`, next to the memory file while it reads, changes and saves the graph, so writes from different processes take turns and none is lost. The lock file exists only while a write is in progress, so the directory holding the memory file must be writable (it already must be, for the atomic save).
+
+- A server stopped mid-write by `SIGINT` or `SIGTERM` (Ctrl-C, `docker stop`, a client shutting it down), or exiting normally, removes the lock it holds before it exits, so the next writer does not wait on it.
+- A lock left behind by a server that crashed mid-write is removed automatically: at once if its process is known to have exited on the same machine, otherwise once it has gone 30 seconds without being refreshed (a server holding the lock refreshes it every 15 seconds while it works). Only one waiting server breaks a stale lock at a time, guarded by a momentary `<memory file>.lock.break` file. It never deletes the lock where it stands: it renames it aside to a momentary `<memory file>.lock.<random>.stale` file, checks that what it took is the very file it judged stale, and only then deletes it. A live lock that replaced the stale one in between is put straight back, untouched, and the breaker goes on waiting.
+- The same momentary `<memory file>.lock.break` file orders every hand-off of the lock, not only the breaking of a stale one. A server takes it to release its lock, and a server that has just created the lock waits until no `.lock.break` file is there, then checks the lock is still its own, before it writes. So a lock cannot be broken and taken over halfway through its holder's release, and a writer cannot start in the moment a live lock spends moved aside. A `.lock.break` file left by a crash is cleared once it is 30 seconds old, so it delays the next write by at most that long. This holds as long as no server stalls for 30 seconds in the middle of a hand-off.
+- Servers of different versions can share a memory file: the lock file, what it holds and the `.lock.break` file are the same in every version. A server at 2.2.1 or earlier takes the `.lock.break` file only to break a stale lock, so its own releases and acquisitions are not ordered this way, and the gaps described above stay open for that server (each needs a lock to go stale first). Upgrade every server sharing a file to close them.
+- A write that cannot get the lock within 60 seconds fails with a tool error rather than overwriting the file.
+- The lock relies on exclusive file creation, which local filesystems provide; a network filesystem that does not honour it cannot be shared safely this way.
+
+#### Limiting how large the graph grows
+
+Every write tool reads the whole memory file, changes the graph and writes the whole file back, holding the lock throughout. Its cost, and how long other servers sharing the file wait for the lock, therefore grow linearly with the file, however small the change: adding one entity to a graph of 100,000 entities rewrites the whole file, about 24 MB at around 240 bytes per entity, in roughly 0.4 seconds on a laptop (#5525). The read tools load the whole file too. Size a shared file with that in mind.
+
+By default nothing caps the graph. Set `MEMORY_MAX_ENTITIES`, `MEMORY_MAX_RELATIONS` or `MEMORY_MAX_FILE_BYTES` to put a ceiling on it:
+
+- `create_entities`, `create_relations` and `add_observations` refuse a call that would leave the graph over a limit, with a tool error naming the variable. The whole call is refused and nothing is saved, not just the part past the limit.
+- A call that adds nothing new (every entity or relation already exists, say) is still answered, even when the graph is at or over a limit.
+- The delete tools are never refused, so a graph over a limit (one that grew before the limit was set, or lowered) can always be shrunk. While it is over, calls that would grow it further on that dimension are refused.
+- `MEMORY_MAX_FILE_BYTES` counts the bytes of the file as it would be saved, unreadable lines included, so it bounds the cost of each write directly. The counts are easier to reason about but do not bound how long each entity's observations grow.
 
 # VS Code Installation Instructions
 
@@ -256,10 +343,7 @@ Alternatively, you can add the configuration to a file called `.vscode/mcp.json`
   "servers": {
     "memory": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ]
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
     }
   }
 }
@@ -272,12 +356,7 @@ On Windows, use:
   "servers": {
     "memory": {
       "command": "cmd",
-      "args": [
-        "/c",
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-memory"
-      ]
+      "args": ["/c", "npx", "-y", "@modelcontextprotocol/server-memory"]
     }
   }
 }
@@ -307,7 +386,7 @@ On Windows, use:
 
 The prompt for utilizing memory depends on the use case. Changing the prompt will help the model determine the frequency and types of memories created.
 
-Here is an example prompt for chat personalization. You could use this prompt in the "Custom Instructions" field of a [Claude.ai Project](https://www.anthropic.com/news/projects). 
+Here is an example prompt for chat personalization. You could use this prompt in the "Custom Instructions" field of a [Claude.ai Project](https://www.anthropic.com/news/projects).
 
 ```
 Follow these steps for each interaction:
@@ -340,10 +419,56 @@ Follow these steps for each interaction:
 Docker:
 
 ```sh
-docker build -t mcp/memory -f src/memory/Dockerfile . 
+docker build -t mcp/memory -f src/memory/Dockerfile .
 ```
 
-For Awareness: a prior mcp/memory volume contains an index.js file that could be overwritten by the new container. If you are using a docker volume for storage, delete the old docker volume's `index.js` file before starting the new container.
+### Upgrading a Docker install
+
+The [Docker](#docker) setup mounts the named volume `claude-memory` over `/app/dist`, the image's code directory, so the volume holds the server's code (`index.js`, `version.js`) next to your `memory.jsonl`. Docker copies an image's files into a named volume only while the volume is empty. Once the volume holds your graph, a newer image never reaches it: the container keeps running the code from the image that first filled the volume, which may not even start against the newer image's dependencies. Deleting `index.js` from the volume does not help; it leaves `/app/dist` with no entry point.
+
+To upgrade, build or pull the new `mcp/memory` image, quit the MCP clients that start it, then replace the code in the volume with the new image's, keeping `memory.jsonl`:
+
+```sh
+docker run --rm -v claude-memory:/volume --user root --entrypoint sh mcp/memory \
+  -c 'rm -f /volume/*.js && cp /app/dist/*.js /volume/ && chown -R node:node /volume'
+```
+
+The volume is mounted at `/volume` rather than `/app/dist`, so the image's own `/app/dist` stays visible to copy from. Only the `.js` files are replaced; `memory.jsonl` (or a legacy `memory.json`) is left as it is. Repeat this after every image update.
+
+The image runs the server as the unprivileged `node` user, not root, so it must own the volume to save the graph. A volume an older image created, which ran as root, is owned by root, and without the `chown` above the server fails to save with `EACCES`. That is why this step runs as `--user root` and ends by giving the volume to `node`.
+
+#### Alternative: keep the graph in a volume of its own
+
+Mounting a volume on a directory of its own and pointing `MEMORY_FILE_PATH` at it keeps the code out of the volume, so a new image takes effect with no copying step:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "-v",
+        "claude-memory-data:/data",
+        "-e",
+        "MEMORY_FILE_PATH=/data/memory.jsonl",
+        "--rm",
+        "mcp/memory"
+      ]
+    }
+  }
+}
+```
+
+To move an existing graph from the `claude-memory` volume into the new one, quit the MCP clients that start the server, then run:
+
+```sh
+docker run --rm -v claude-memory:/old -v claude-memory-data:/data \
+  --entrypoint cp mcp/memory /old/memory.jsonl /data/memory.jsonl
+```
+
+If the old volume holds only a legacy `memory.json`, copy `/old/memory.json` to `/data/memory.jsonl` instead. Once the server has started on the new volume with your graph, you can remove the old volume with `docker volume rm claude-memory`.
 
 ## License
 
