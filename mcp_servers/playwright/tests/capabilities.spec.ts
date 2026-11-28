@@ -23,6 +23,7 @@ test('test snapshot tool list', async ({ client }) => {
     'browser_console_messages',
     'browser_drag',
     'browser_drop',
+    'browser_emulate_media',
     'browser_evaluate',
     'browser_file_upload',
     'browser_fill_form',

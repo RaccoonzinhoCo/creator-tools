@@ -1,51 +1,146 @@
 #!/usr/bin/env node
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+// The memory server: a knowledge graph of entities, relations and
+// observations, persisted as JSONL and served over MCP as nine tools and one
+// subscribable resource. createServer() builds a server over a graph file so
+// tests can run it in-process; main() serves it on stdio through the SDK's
+// serveStdio entry, which answers 2026-07-28 clients (server/discover, change
+// notifications on subscriptions/listen) and 2025-era clients (initialize,
+// resources/subscribe) from the same factory (#4852). run() reads --transport
+// and starts stdio (the default) or Streamable HTTP (http.ts, #576). It runs
+// only when this file is the process entry point, so importing it starts
+// nothing.
+import {
+  serveStdio,
+  type StdioServerHandle,
+} from "@modelcontextprotocol/server/stdio";
+import { McpServer } from "@modelcontextprotocol/server";
+import type { Transport } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { promises as fs } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import {
+  promises as fs,
+  closeSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+} from "fs";
+import type { FileHandle } from "fs/promises";
+import path from "path";
+import os from "os";
+import { randomBytes } from "crypto";
+import { fileURLToPath } from "url";
+import { SERVER_VERSION } from "./version.js";
+
+// The package directory: where the default graph file lives, and what a
+// relative MEMORY_FILE_PATH resolves against.
+const defaultMemoryDir = path.dirname(fileURLToPath(import.meta.url));
 
 // Define memory file path using environment variable with fallback
-export const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.jsonl');
+export const defaultMemoryPath = path.join(defaultMemoryDir, "memory.jsonl");
 
-// Handle backward compatibility: migrate memory.json to memory.jsonl if needed
-export async function ensureMemoryFilePath(): Promise<string> {
-  if (process.env.MEMORY_FILE_PATH) {
-    // Custom path provided, use it as-is (with absolute path resolution)
-    return path.isAbsolute(process.env.MEMORY_FILE_PATH)
-      ? process.env.MEMORY_FILE_PATH
-      : path.join(path.dirname(fileURLToPath(import.meta.url)), process.env.MEMORY_FILE_PATH);
+// Expand a leading "~" to the user's home directory. MCP clients pass
+// MEMORY_FILE_PATH from JSON config, where no shell performs tilde expansion,
+// so an unexpanded "~" would otherwise be treated as a relative path and
+// joined onto the package directory. Mirrors the helper of the same name in
+// the filesystem server (src/filesystem/path-utils.ts).
+export function expandHome(filepath: string): string {
+  if (filepath.startsWith("~/") || filepath === "~") {
+    return path.join(os.homedir(), filepath.slice(1));
   }
-  
+  return filepath;
+}
+
+// Handle backward compatibility: migrate memory.json to memory.jsonl if needed.
+// baseDir is the directory the default files live in. The server never passes
+// it; it exists so tests can run the migration in a temporary directory rather
+// than in the package directory, which every importer of this module shares.
+export async function ensureMemoryFilePath(
+  baseDir: string = defaultMemoryDir,
+): Promise<string> {
+  if (process.env.MEMORY_FILE_PATH) {
+    // Custom path provided. Expand a leading "~" first, then resolve relative
+    // paths against the package directory (absolute paths are used as-is).
+    const customPath = expandHome(process.env.MEMORY_FILE_PATH);
+    return path.isAbsolute(customPath)
+      ? customPath
+      : path.join(baseDir, customPath);
+  }
+
   // No custom path set, check for backward compatibility migration
-  const oldMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
-  const newMemoryPath = defaultMemoryPath;
-  
-  try {
-    // Check if old file exists and new file doesn't
-    await fs.access(oldMemoryPath);
-    try {
-      await fs.access(newMemoryPath);
-      // Both files exist, use new one (no migration needed)
-      return newMemoryPath;
-    } catch {
-      // Old file exists, new file doesn't - migrate
-      console.error('DETECTED: Found legacy memory.json file, migrating to memory.jsonl for JSONL format compatibility');
-      await fs.rename(oldMemoryPath, newMemoryPath);
-      console.error('COMPLETED: Successfully migrated memory.json to memory.jsonl');
-      return newMemoryPath;
-    }
-  } catch {
-    // Old file doesn't exist, use new path
+  const oldMemoryPath = path.join(baseDir, "memory.json");
+  const newMemoryPath = path.join(baseDir, "memory.jsonl");
+
+  // Only a missing legacy file means there is nothing to migrate. Any other
+  // failure, from the existence checks or the rename itself, propagates and
+  // stops startup: carrying on would serve an empty memory.jsonl while the
+  // user's graph sat unread in memory.json (#5203).
+  if (!(await pathExists(oldMemoryPath))) {
     return newMemoryPath;
+  }
+  if (await pathExists(newMemoryPath)) {
+    // Both files exist, use new one (no migration needed)
+    return newMemoryPath;
+  }
+
+  // Old file exists, new file doesn't - migrate
+  console.error(
+    "DETECTED: Found legacy memory.json file, migrating to memory.jsonl for JSONL format compatibility",
+  );
+  try {
+    await fs.rename(oldMemoryPath, newMemoryPath);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Failed to migrate legacy memory file ${oldMemoryPath} to ${newMemoryPath}: ${reason}. ` +
+        "The server will not start on an empty graph; fix the cause and restart, " +
+        "or set MEMORY_FILE_PATH to choose a file explicitly.",
+      { cause: error },
+    );
+  }
+  console.error("COMPLETED: Successfully migrated memory.json to memory.jsonl");
+  return newMemoryPath;
+}
+
+// True when filePath exists, false when it does not (ENOENT). Any other error,
+// such as a permission failure, is rethrown rather than read as "missing".
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
   }
 }
 
-// Initialize memory file path (will be set during startup)
-let MEMORY_FILE_PATH: string;
+// The startup warning for a memory file inside a node_modules tree, or
+// undefined for any other path. npx and npm install the server under
+// node_modules, so the default memory.jsonl beside dist/index.js lands there,
+// and npm treats that tree as its own: a reinstall, an update or a cleared npx
+// cache can delete the file and the graph in it (#4117). The default is not
+// moved, since that would strand every existing graph; the warning says how to
+// choose a durable path instead. Only node_modules is matched, not the server's
+// directory as such: the Docker setup mounts a volume over /app/dist, and a
+// source checkout's dist survives a rebuild, so there the default is durable.
+export function memoryFileLocationWarning(
+  memoryFilePath: string,
+): string | undefined {
+  // Both separators, so a Windows path is matched on any platform.
+  const segments = path.resolve(memoryFilePath).split(/[\\/]/);
+  if (!segments.includes("node_modules")) {
+    return undefined;
+  }
+  return (
+    `WARNING: the memory file ${memoryFilePath} is inside a node_modules directory, ` +
+    "which npm manages: reinstalling or updating the server, or clearing the npx cache, " +
+    "can delete it and the knowledge graph it holds. Set MEMORY_FILE_PATH to an absolute " +
+    "path outside node_modules, in a directory that exists (for example ~/memory.jsonl), " +
+    "and move this file there to keep the graph."
+  );
+}
 
 // We are storing our memory using entities, relations, and observations in a graph structure
 export interface Entity {
@@ -65,484 +160,1819 @@ export interface KnowledgeGraph {
   relations: Relation[];
 }
 
+// Names of requested entities that createEntities did not create: the name
+// already existed, or repeated earlier in the same batch. createEntities
+// returns the created entities themselves, so identity tells them apart.
+export function skippedEntityNames(
+  requested: Entity[],
+  created: Entity[],
+): string[] {
+  return requested.filter((e) => !created.includes(e)).map((e) => e.name);
+}
+
+// Text telling the agent which entities create_entities skipped.
+export function skippedEntitiesNotice(skipped: string[]): string {
+  const one = skipped.length === 1;
+  return (
+    `Skipped ${skipped.length} ${one ? "entity that already exists" : "entities that already exist"}: ` +
+    `${skipped.join(", ")}. ${one ? "Its" : "Their"} observations were not added; ` +
+    "use add_observations for existing entities."
+  );
+}
+
+// Opt-in ceilings on how large the write tools may grow the graph (#5525).
+// Every mutation reads the whole graph file and writes it back under the
+// cross-process lock, so its cost, and how long it holds the lock, grow
+// linearly with the file. These let an operator bound that growth. Each is
+// unset by default, which leaves the store unbounded, as it always was.
+export interface GraphLimits {
+  // Most entities the graph may hold.
+  maxEntities?: number;
+  // Most relations the graph may hold.
+  maxRelations?: number;
+  // Most bytes the saved graph file may hold.
+  maxFileBytes?: number;
+}
+
+// The environment variable that sets each limit.
+export const GRAPH_LIMIT_ENV: Readonly<Record<keyof GraphLimits, string>> = {
+  maxEntities: "MEMORY_MAX_ENTITIES",
+  maxRelations: "MEMORY_MAX_RELATIONS",
+  maxFileBytes: "MEMORY_MAX_FILE_BYTES",
+};
+
+// Read the limits from the environment. Only an unset variable leaves its
+// limit off; any other value that is not a positive whole number, an empty
+// one included, stops startup, since a limit silently ignored would leave the
+// store unbounded while the operator believes it capped.
+export function graphLimitsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): GraphLimits {
+  const limits: GraphLimits = {};
+  for (const key of Object.keys(GRAPH_LIMIT_ENV) as (keyof GraphLimits)[]) {
+    const name = GRAPH_LIMIT_ENV[key];
+    if (env[name] === undefined) {
+      continue;
+    }
+    const raw = env[name].trim();
+    const value = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1) {
+      throw new Error(
+        `${name} must be a positive whole number, got "${env[name]}". ` +
+          "Unset it to leave that limit off.",
+      );
+    }
+    limits[key] = value;
+  }
+  return limits;
+}
+
+// How large a graph is, on each dimension GraphLimits caps.
+interface GraphSize {
+  entities: number;
+  relations: number;
+  bytes: number;
+}
+
+// Timings for the cross-process lock around each mutation. Exposed so tests
+// can shorten them; the server always uses the defaults.
+export interface FileLockOptions {
+  // A lock not refreshed for this long is presumed abandoned and is broken.
+  staleMs?: number;
+  // Give up, failing the mutation, after waiting this long for the lock.
+  timeoutMs?: number;
+  // Wait between attempts, plus up to the same again of random jitter.
+  retryMs?: number;
+}
+
+// For best-effort lock cleanup, whose failure must not mask the real outcome.
+function ignoreError(): void {}
+
+// Whether opening a lock file failed because the file is held right now. On
+// Windows, opening a file that another process is still deleting fails with
+// EPERM rather than EEXIST until the deletion completes, so there EPERM means
+// "held" too.
+function isLockBusy(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return (
+    code === "EEXIST" || (process.platform === "win32" && code === "EPERM")
+  );
+}
+
+// Whether the process that wrote a lock file is known to be gone. Only a
+// process on this host can be checked; for any other host, or a lock whose
+// contents cannot be read, the lock's age decides instead.
+function isLockOwnerDead(contents: string): boolean {
+  let owner: unknown;
+  try {
+    owner = JSON.parse(contents);
+  } catch {
+    return false;
+  }
+  const { pid, hostname } = (owner ?? {}) as Record<string, unknown>;
+  if (typeof pid !== "number" || hostname !== os.hostname()) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+// What a waiter learns from one look at a lock file: whether it is abandoned,
+// and which file it looked at. The device and inode numbers identify the file
+// itself rather than its path, so a later check can tell that file from one
+// that has replaced it at the same path. They are read as bigints because a
+// Windows file id does not fit in a double.
+interface LockJudgement {
+  stale: boolean;
+  dev: bigint;
+  ino: bigint;
+}
+
+// Judge the lock file open at handle. Its owner and its mtime are read
+// through that one handle, so both describe the same lock file even if it is
+// replaced meanwhile.
+async function judgeLock(
+  handle: FileHandle,
+  staleMs: number,
+): Promise<LockJudgement> {
+  const [contents, stats] = await Promise.all([
+    handle.readFile("utf-8"),
+    handle.stat({ bigint: true }),
+  ]);
+  return {
+    stale:
+      isLockOwnerDead(contents) || Date.now() - Number(stats.mtimeMs) > staleMs,
+    dev: stats.dev,
+    ino: stats.ino,
+  };
+}
+
+// Whether the lock at lockPath is abandoned.
+async function isLockStale(
+  lockPath: string,
+  staleMs: number,
+): Promise<boolean> {
+  const handle = await fs.open(lockPath, "r");
+  try {
+    return (await judgeLock(handle, staleMs)).stale;
+  } finally {
+    await handle.close();
+  }
+}
+
+// The lock protocol, for writers in separate processes sharing lockPath.
+//
+// The lock is a file created with O_EXCL: exactly one creator wins. Next to
+// it stands a second O_EXCL file, the guard (`<lock>.break`), held for a few
+// file-system calls at a time. The guard orders every change of the lock
+// path's occupant other than the create itself (#5565):
+//
+// - Breaking a stale lock happens under the guard (breakStaleLock).
+// - Releasing a lock happens under the guard (releaseLock, and
+//   releaseHeldLocks at exit): the holder compares the token and removes the
+//   file with no breaker able to act in between, and never while a breaker
+//   has that lock renamed aside.
+// - A writer that has just created the lock does not run until no guard
+//   stands, and then checks that the file at lockPath still holds its token
+//   (withFileLock). A lock created while a breaker had a live lock aside is
+//   overwritten when the breaker puts that lock back; its creator finds the
+//   other token and goes back to waiting.
+//
+// What this rests on, and where it stops:
+//
+// - No process stalls for longer than staleMs inside a guarded section. A
+//   guard older than staleMs is taken to be left by a crash and is cleared,
+//   so writers never deadlock on one; a holder that really did stall that
+//   long there loses the guard's protection. The same holds for the lock: a
+//   holder that stops refreshing it for staleMs is presumed dead. A lock
+//   file can go no further without a lock the kernel releases itself, which
+//   Node offers only through a native dependency.
+// - A guard left by a crash is cleared by path. Two processes clearing the
+//   same one at once can remove a guard a third took in between, which
+//   leaves that third process unguarded for its few calls (#5624).
+// - A server older than this change takes the guard only to break a lock. It
+//   releases without the guard and runs as soon as it has created the lock.
+//   Sharing a memory file with one is safe in every way it was before (same
+//   lock file, same contents, same guard, same stale rules), and each
+//   hand-off window above is closed for the newer process's own acquire and
+//   release, whichever version the breaker runs. The older process's own
+//   release and acquire keep the windows they had.
+
+// The guard file that orders changes to the lock at lockPath.
+function guardPathOf(lockPath: string): string {
+  return `${lockPath}.break`;
+}
+
+// The guards this process holds right now, so the exit hook can remove them:
+// a guard left behind stalls the next writer until it goes stale.
+const heldGuards = new Set<string>();
+
+// Wait before another attempt: retryMs, plus up to the same again of jitter.
+function pause(retryMs: number): Promise<void> {
+  return new Promise((resolve) =>
+    setTimeout(resolve, retryMs + Math.random() * retryMs),
+  );
+}
+
+// Whether a guard stands at guardPath. One left by a crash (older than
+// staleMs) is cleared on the way, and still reported: the caller looks again.
+async function isGuardHeld(
+  guardPath: string,
+  staleMs: number,
+): Promise<boolean> {
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(guardPath, "r");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    // On Windows, a guard still being deleted: it stands for a moment yet.
+    if (isLockBusy(error)) {
+      return true;
+    }
+    throw error;
+  }
+  try {
+    if ((await judgeLock(handle, staleMs)).stale) {
+      await fs.unlink(guardPath).catch(ignoreError);
+    }
+  } finally {
+    await handle.close();
+  }
+  return true;
+}
+
+// Take the guard if it is free, returning whether it was taken. A guard that
+// is held is left to its holder, unless a crash left it: that one is cleared,
+// for the next attempt.
+async function tryTakeGuard(
+  guardPath: string,
+  staleMs: number,
+): Promise<boolean> {
+  let guard: FileHandle;
+  try {
+    guard = await fs.open(guardPath, "wx");
+  } catch (error) {
+    if (!isLockBusy(error)) {
+      throw error;
+    }
+    await isGuardHeld(guardPath, staleMs);
+    return false;
+  }
+  // Tracked before anything else is awaited, as a lock is (see withFileLock).
+  heldGuards.add(guardPath);
+  await guard.close().catch(ignoreError);
+  return true;
+}
+
+// Give up a guard this process took. The removal and the end of its tracking
+// are one synchronous step: were the removal awaited, an exit arriving before
+// its continuation would still find the guard tracked, and the exit hook
+// would remove, as this process's own, a guard another process had taken at
+// the same path in between.
+function dropGuard(guardPath: string): void {
+  try {
+    unlinkSync(guardPath);
+  } catch {
+    // Already gone: cleared as stale, or removed by the exit hook.
+  }
+  heldGuards.delete(guardPath);
+}
+
+// Whether a rename that replaces a file failed only because the file being
+// replaced is open right now. On Windows, renaming over a file that anything
+// holds open fails with EPERM (or EACCES, or EBUSY) until that handle closes.
+// Elsewhere a rename never fails for that reason, and these codes are lasting.
+function isReplaceBusy(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return (
+    process.platform === "win32" &&
+    (code === "EPERM" || code === "EACCES" || code === "EBUSY")
+  );
+}
+
+// Put a live lock that breakStaleLock took aside by mistake back at lockPath.
+// A writer that created the lock in the gap keeps opening its file while it
+// waits for the guard to go (confirmLock), so on Windows the rename over that
+// file can fail for a moment. Giving up then would drop the guard with the
+// live lock still aside, and that writer would run beside its holder (#5635).
+// So the rename is retried, still under the guard, until it lands. No attempt
+// starts once half of staleMs has passed since the guard was taken: past
+// staleMs the guard is taken to be left by a crash and protects nothing, and
+// the other half is the margin for the attempt in flight. A put-back that
+// cannot be made fails with an error of its own rather than the rename's
+// code, which on Windows would read as a busy lock and send this writer back
+// to acquiring with the live lock still aside.
+async function restoreLock(
+  asidePath: string,
+  lockPath: string,
+  guardTakenAt: number,
+  staleMs: number,
+  retryMs: number,
+): Promise<void> {
+  const deadline = guardTakenAt + staleMs / 2;
+  for (;;) {
+    try {
+      await fs.rename(asidePath, lockPath);
+      return;
+    } catch (error) {
+      if (!isReplaceBusy(error)) {
+        throw error;
+      }
+      await pause(retryMs);
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Could not put back the live memory file lock ${lockPath}, left at ${asidePath}`,
+          { cause: error },
+        );
+      }
+    }
+  }
+}
+
+// Remove an abandoned lock, returning whether it did. Breaking happens under
+// the guard, so only one waiter breaks at a time and re-checks the lock under
+// it: two waiters can never both judge the same abandoned lock stale and one
+// then remove the lock the other has just taken in its place.
+//
+// The guard keeps every writer that takes part in it from changing the lock
+// meanwhile, but not a server older than #5565, whose release ignores it, nor
+// a breaker that stalled past staleMs and lost its guard to another. So the
+// file at lockPath can still be replaced by a successor's live lock after the
+// re-check has judged it stale. Removing by path would then delete that live
+// lock and let a third writer in beside its holder (#5560). So the lock is
+// never deleted where it stands. It is renamed aside to a name nobody else
+// uses, which is atomic and takes whichever file is at lockPath at that
+// instant, and what was taken is then compared with the file that was judged:
+// the judged file is deleted, and anything else is a live lock and is renamed
+// straight back. The handle the judgement was read through stays open until
+// then, so the judged file's inode number cannot be reused by a successor's
+// file and the comparison cannot be fooled.
+//
+// While a live lock is aside the lock path is free. The guard is still held
+// then, which is what covers that moment: a writer that creates the lock in
+// it waits for the guard to go, finds the restored lock's token in place of
+// its own, and does not run; and the live lock's holder cannot release until
+// its lock is back, so no lock is restored after its holder has finished.
+async function breakStaleLock(
+  lockPath: string,
+  staleMs: number,
+  retryMs: number,
+): Promise<boolean> {
+  const guardPath = guardPathOf(lockPath);
+  // Read before the guard is created, so it is never later than the time the
+  // guard's age is counted from.
+  const guardTakenAt = Date.now();
+  if (!(await tryTakeGuard(guardPath, staleMs))) {
+    // Another waiter is breaking the lock, or its holder is releasing it.
+    return false;
+  }
+  try {
+    const judged = await fs.open(lockPath, "r");
+    try {
+      const { stale, dev, ino } = await judgeLock(judged, staleMs);
+      if (!stale) {
+        return false;
+      }
+      const asidePath = `${lockPath}.${randomBytes(8).toString("hex")}.stale`;
+      await fs.rename(lockPath, asidePath);
+      const taken = await fs.stat(asidePath, { bigint: true });
+      if (taken.dev !== dev || taken.ino !== ino) {
+        // Not the lock that was judged: a successor's live one. Put it back.
+        await restoreLock(asidePath, lockPath, guardTakenAt, staleMs, retryMs);
+        return false;
+      }
+      console.error(`Breaking stale memory file lock ${lockPath}`);
+      await fs.unlink(asidePath);
+      return true;
+    } finally {
+      await judged.close();
+    }
+  } finally {
+    dropGuard(guardPath);
+  }
+}
+
+// The lock files this process holds right now, each mapped to the token it
+// writes into it and whether that write has finished. withFileLock releases its lock in a `finally`, which never
+// runs when a signal ends the process, so the exit hook releaseHeldLocks()
+// removes them instead (#5485). Without it, a lock left by a stopped server
+// stalls the next writer until it goes stale, which takes the full staleMs
+// when that writer is on another host (another container) and cannot see
+// that this process has gone.
+interface HeldLock {
+  token: string;
+  written: boolean;
+}
+const heldLocks = new Map<string, HeldLock>();
+
+// The lock paths this process holds right now, for tests.
+export function heldLockPaths(): string[] {
+  return [...heldLocks.keys()];
+}
+
+// Stop tracking held, unless lockPath is tracked for another lock by now: one
+// that a later withFileLock call in this process took at the same path.
+function untrackLock(lockPath: string, held: HeldLock): void {
+  if (heldLocks.get(lockPath) === held) {
+    heldLocks.delete(lockPath);
+  }
+}
+
+// Synchronously remove every lock this process still holds, as the process
+// exits: an `exit` listener cannot wait on a promise. As in withFileLock's own
+// release, a lock is removed only while it still holds this process's token,
+// so a lock broken as stale and re-taken by another process stays in place,
+// and only under the guard, so it cannot be broken and re-taken between the
+// comparison and the removal (#5565). An exit cannot wait for a guard either:
+// when another process holds it (it is breaking this lock, or a crash left
+// the guard behind), the lock is left where it is, to be broken as the lock
+// of a process that has exited. A guard this process itself holds, because
+// the exit interrupted its own release or break, is used and then removed.
+// A lock is tracked from the moment its exclusive create returns, before its
+// token is written. Until that write finishes, a file holding only the start
+// of the token (or none of it) is ours too: the exit interrupted the write.
+// Nothing else can have replaced it by then, since a lock that new, with a
+// live owner, is never judged stale. Once the token is written only an exact
+// match is ours, so another writer's replacement, empty while its own token
+// is being written, is left alone.
+export function releaseHeldLocks(): void {
+  for (const [lockPath, { token, written }] of heldLocks) {
+    const guardPath = guardPathOf(lockPath);
+    try {
+      if (!heldGuards.has(guardPath)) {
+        closeSync(openSync(guardPath, "wx"));
+        heldGuards.add(guardPath);
+      }
+      const contents = readFileSync(lockPath, "utf-8");
+      if (written ? contents === token : token.startsWith(contents)) {
+        unlinkSync(lockPath);
+      }
+    } catch {
+      // The guard is held elsewhere, or the lock is already gone or
+      // unreadable: there is nothing here that is safely ours to remove.
+    }
+  }
+  heldLocks.clear();
+  for (const guardPath of heldGuards) {
+    try {
+      unlinkSync(guardPath);
+    } catch {
+      // Already gone.
+    }
+  }
+  heldGuards.clear();
+}
+
+// The exit codes a shell reports for a process its signal ended: 128 + the
+// signal's number.
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
+
+let exitLockCleanupInstalled = false;
+let lockCleanupInstalled = false;
+
+// Release held locks when the process exits normally or through
+// process.exit(), by the `exit` event. Installed once, however the server is
+// started. It covers a signal only when something turns that signal into a
+// process.exit(): installLockCleanup() does for stdio, and run() does for
+// Streamable HTTP, whose signals first close the listener (#5595).
+export function installExitLockCleanup(): void {
+  if (exitLockCleanupInstalled) {
+    return;
+  }
+  exitLockCleanupInstalled = true;
+  process.on("exit", releaseHeldLocks);
+}
+
+// Release held locks however the server process ends (#5485): on a normal
+// exit or process.exit() through the `exit` event, and on SIGINT or SIGTERM,
+// whose default action would end the process without emitting `exit`. A
+// signal handler replaces that default, so it exits itself, with the status
+// the default would have given. Installed once, by main(): only the server
+// process should take over its signals, not a test that imports this module.
+export function installLockCleanup(): void {
+  if (lockCleanupInstalled) {
+    return;
+  }
+  lockCleanupInstalled = true;
+  installExitLockCleanup();
+  for (const [signal, code] of Object.entries(SIGNAL_EXIT_CODES)) {
+    process.on(signal, () => process.exit(code));
+  }
+}
+
+// Remove the lock at lockPath if it still holds token: if it was broken as
+// stale while this process held it, the file may now belong to another
+// process. The comparison and the removal happen under the guard, so no
+// breaker can replace the lock between them, and a lock a breaker has aside
+// is back in place before it is looked for (#5565). The wait for the guard is
+// short: its holders keep it for a few file-system calls, and one left by a
+// crash is cleared once it is staleMs old. If the guard cannot be created at
+// all (the directory has gone, say), the lock is still compared and removed,
+// unguarded, rather than left for every other writer to wait out.
+async function releaseLock(
+  lockPath: string,
+  token: string,
+  staleMs: number,
+  retryMs: number,
+): Promise<void> {
+  const guardPath = guardPathOf(lockPath);
+  let guarded = false;
+  try {
+    while (!(await tryTakeGuard(guardPath, staleMs))) {
+      await pause(retryMs);
+    }
+    guarded = true;
+  } catch {
+    // Released without the guard, below.
+  }
+  const current = await fs.readFile(lockPath, "utf-8").catch(() => null);
+  if (current === token) {
+    await fs.unlink(lockPath).catch(ignoreError);
+  }
+  if (guarded) {
+    dropGuard(guardPath);
+  }
+}
+
+// Refresh the lock at lockPath, if it still holds token, so it does not go
+// stale while its holder is alive. Returns false once the lock holds another
+// token: it changed hands, and keeping it fresh would stop a crashed new
+// owner's lock from ever going stale.
+async function refreshLock(lockPath: string, token: string): Promise<boolean> {
+  if ((await fs.readFile(lockPath, "utf-8")) !== token) {
+    return false;
+  }
+  const now = new Date();
+  await fs.utimes(lockPath, now, now);
+  return true;
+}
+
+// Whether the lock this writer has just created at lockPath is still its own
+// once no break is in progress. A breaker that took a live lock aside by
+// mistake puts it back over whatever stands at lockPath, and it holds the
+// guard until it has. So the creator waits for the guard to go, then reads
+// the token: its own means no restored lock displaced it, and none can now,
+// since a breaker that starts later judges this fresh lock live and leaves
+// it. The wait is not bounded by the caller's timeout, because a lock held
+// meanwhile cannot be given up safely by path; it ends within a few
+// file-system calls, or once a guard left by a crash is staleMs old. The lock
+// is refreshed on every turn of that wait: its heartbeat has not started, and
+// a lock that aged alongside a crash-left guard would otherwise look
+// abandoned the moment the guard is cleared.
+async function confirmLock(
+  lockPath: string,
+  token: string,
+  staleMs: number,
+  retryMs: number,
+): Promise<boolean> {
+  while (await isGuardHeld(guardPathOf(lockPath), staleMs)) {
+    // A failure here (the lock is aside, or gone) is left to the check below.
+    await refreshLock(lockPath, token).catch(ignoreError);
+    await pause(retryMs);
+  }
+  try {
+    return (await fs.readFile(lockPath, "utf-8")) === token;
+  } catch (error) {
+    // Renamed aside and deleted: not ours any more. Anything else is a
+    // failure to read our own lock, and fails the acquisition.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// Run operation while holding an exclusive lock file at lockPath, so that
+// mutations from separate server processes sharing one graph file take turns
+// and each one loads the graph the previous one saved (#4797). The lock is a
+// file created with O_EXCL, which is atomic on local filesystems: exactly one
+// creator wins. The holder refreshes the lock's mtime every staleMs / 2 while
+// it runs. A lock left behind by a crashed process is broken once its owner
+// is known to be dead, or once it has gone unrefreshed for staleMs. How
+// acquiring, releasing and breaking are ordered against each other is
+// described above guardPathOf().
+export async function withFileLock<T>(
+  lockPath: string,
+  operation: () => Promise<T>,
+  { staleMs = 30_000, timeoutMs = 60_000, retryMs = 10 }: FileLockOptions = {},
+): Promise<T> {
+  const token = JSON.stringify({
+    pid: process.pid,
+    hostname: os.hostname(),
+    token: randomBytes(16).toString("hex"),
+  });
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    let handle: FileHandle | undefined;
+    try {
+      handle = await fs.open(lockPath, "wx");
+    } catch (error) {
+      if (!isLockBusy(error)) {
+        throw error;
+      }
+    }
+    if (handle) {
+      // Track the lock before anything else is awaited: a signal is handled
+      // only between tasks, never between the open's completion and this
+      // line, so from here on the exit hook can remove it (#5485).
+      const held: HeldLock = { token, written: false };
+      heldLocks.set(lockPath, held);
+      let confirmed: boolean;
+      try {
+        await handle.writeFile(token);
+        held.written = true;
+        await handle.close();
+        confirmed = await confirmLock(lockPath, token, staleMs, retryMs);
+      } catch (error) {
+        // The lock was created but not written, or could not be confirmed:
+        // remove it rather than leave every other writer waiting for it to
+        // go stale. Before its token is written the file can only be ours.
+        // After, a breaker may have put another holder's lock back over it,
+        // so it is released like any held lock: only if it still holds our
+        // token.
+        await handle.close().catch(ignoreError);
+        if (held.written) {
+          await releaseLock(lockPath, token, staleMs, retryMs);
+        } else {
+          await fs.unlink(lockPath).catch(ignoreError);
+        }
+        untrackLock(lockPath, held);
+        throw error;
+      }
+      if (confirmed) {
+        break;
+      }
+      // A lock put back by a breaker displaced ours, so it was never held:
+      // stop tracking it and wait for the lock like any other writer.
+      untrackLock(lockPath, held);
+      continue;
+    }
+
+    // Someone else holds the lock. Break it if it is abandoned; otherwise
+    // wait and try again.
+    try {
+      if (
+        (await isLockStale(lockPath, staleMs)) &&
+        (await breakStaleLock(lockPath, staleMs, retryMs))
+      ) {
+        continue;
+      }
+    } catch (error) {
+      // The holder released the lock between our attempts: try again now.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        continue;
+      }
+      // On Windows, the lock is still being deleted: wait, then try again.
+      if (!isLockBusy(error)) {
+        throw error;
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out after ${timeoutMs} ms waiting for the memory file lock ${lockPath}`,
+      );
+    }
+    await pause(retryMs);
+  }
+
+  // Keep the lock fresh while the operation runs, so a mutation that outlasts
+  // staleMs (a large graph, a slow disk) is not mistaken for an abandoned one.
+  // Refresh only our own lock, as the release below does: once it is broken
+  // as stale and re-taken, the file belongs to another process, and keeping
+  // it fresh would stop a crashed new owner's lock from ever going stale.
+  const heartbeat = setInterval(() => {
+    // Not awaited: an interval callback has no caller to await it, and every
+    // failure (the lock already gone) is caught and ignored here.
+    void refreshLock(lockPath, token)
+      .then((ours) => {
+        if (!ours) {
+          // The lock changed hands: stop refreshing it, for good.
+          clearInterval(heartbeat);
+        }
+      })
+      .catch(ignoreError);
+  }, staleMs / 2);
+  heartbeat.unref();
+
+  try {
+    return await operation();
+  } finally {
+    clearInterval(heartbeat);
+    await releaseLock(lockPath, token, staleMs, retryMs);
+    // Stop tracking the lock only once the release is done, so an exit during
+    // it still removes the lock. A lock this same process broke as stale and
+    // re-took in another withFileLock call carries that call's token, and
+    // stays tracked for it.
+    if (heldLocks.get(lockPath)?.token === token) {
+      heldLocks.delete(lockPath);
+    }
+  }
+}
+
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
-  constructor(private memoryFilePath: string) {}
+  constructor(
+    private memoryFilePath: string,
+    private lockOptions: FileLockOptions = {},
+    private limits: GraphLimits = {},
+  ) {}
+
+  // Serializes all read-modify-write graph mutations behind a single queue.
+  // Without this, concurrent tool calls (e.g. multiple mutations dispatched
+  // from one LLM turn) each independently load the graph, mutate their own
+  // copy, and write it back — so whichever write lands last silently
+  // overwrites the other's changes, and interleaved writes to the same file
+  // can corrupt it outright. See #1819.
+  // The queue only orders calls within this process, so each queued mutation
+  // also holds a lock file next to the graph file while it runs, which orders
+  // it against other server processes sharing the same file. See #4797.
+  private mutationQueue: Promise<unknown> = Promise.resolve();
+
+  // Members of a stored entity or relation record that the schema does not
+  // model (a createdAt written by an older version or another client, say),
+  // keyed by the parsed object loadGraphWithUnreadable made from that record.
+  // saveGraph writes them back, so a write keeps every record it did not
+  // delete exactly as it found it: that is what makes create_entities,
+  // create_relations and add_observations additive, as their
+  // destructiveHint: false declares (#5058). A WeakMap rather than a property
+  // on the object, so the extras never reach a tool result or read_graph,
+  // whose output schemas do not allow them, and are collected with the graph
+  // they came from. A deleted record is dropped from the graph and takes its
+  // extras with it; one changed in place (add_observations,
+  // delete_observations) keeps its object, so keeps them too.
+  private extraFields = new WeakMap<object, Record<string, unknown>>();
+
+  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    const locked = () =>
+      withFileLock(`${this.memoryFilePath}.lock`, operation, this.lockOptions);
+    const result = this.mutationQueue.then(locked, locked);
+    // Always resolve the queue itself, even if this operation failed, so a
+    // single failed mutation doesn't permanently wedge every call after it.
+    // The failure still propagates normally to whoever awaited `result`.
+    this.mutationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
 
   private async loadGraph(): Promise<KnowledgeGraph> {
+    return (await this.loadGraphWithUnreadable()).graph;
+  }
+
+  // Lines that can't be read (malformed JSON, entries that fail validation,
+  // unknown record types) stay out of the in-memory graph, but mutations pass
+  // them back to saveGraph so they are written out unchanged. Otherwise the
+  // next unrelated write would silently delete them from disk, together with
+  // every valid observation of an entity that has one bad field.
+  // size is the graph as loaded, for the write tools' limit check (see
+  // checkLimits).
+  private async loadGraphWithUnreadable(): Promise<{
+    graph: KnowledgeGraph;
+    unreadable: string[];
+    size: GraphSize;
+  }> {
     try {
       const data = await fs.readFile(this.memoryFilePath, "utf-8");
-      const lines = data.split("\n").filter(line => line.trim() !== "");
-      return lines.reduce((graph: KnowledgeGraph, line) => {
-        const item = JSON.parse(line);
-        if (item.type === "entity") {
-          graph.entities.push({
-            name: item.name,
-            entityType: item.entityType,
-            observations: item.observations
-          });
+      const lines = data.split("\n").filter((line) => line.trim() !== "");
+      const graph: KnowledgeGraph = { entities: [], relations: [] };
+      const unreadable: string[] = [];
+
+      for (const line of lines) {
+        let item: unknown;
+        try {
+          item = JSON.parse(line);
+        } catch {
+          console.error("Skipping malformed line in memory file");
+          unreadable.push(line);
+          continue;
         }
-        if (item.type === "relation") {
-          graph.relations.push({
-            from: item.from,
-            to: item.to,
-            relationType: item.relationType
-          });
+
+        if (typeof item !== "object" || item === null) {
+          console.error("Skipping non-object line in memory file");
+          unreadable.push(line);
+          continue;
         }
-        return graph;
-      }, { entities: [], relations: [] });
+
+        const record = item as Record<string, unknown>;
+        if (record.type === "entity") {
+          const parsed = EntitySchema.safeParse(item);
+          if (parsed.success) {
+            this.keepExtraFields(parsed.data, record, EntitySchema.shape);
+            graph.entities.push(parsed.data);
+          } else {
+            unreadable.push(line);
+            console.error(
+              "Skipping invalid entity in memory file:",
+              parsed.error.issues
+                .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+                .join(", "),
+            );
+          }
+        } else if (record.type === "relation") {
+          const parsed = RelationSchema.safeParse(item);
+          if (parsed.success) {
+            this.keepExtraFields(parsed.data, record, RelationSchema.shape);
+            graph.relations.push(parsed.data);
+          } else {
+            unreadable.push(line);
+            console.error(
+              "Skipping invalid relation in memory file:",
+              parsed.error.issues
+                .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+                .join(", "),
+            );
+          }
+        } else {
+          unreadable.push(line);
+        }
+      }
+
+      const size = {
+        entities: graph.entities.length,
+        relations: graph.relations.length,
+        bytes: Buffer.byteLength(data, "utf-8"),
+      };
+      return { graph, unreadable, size };
     } catch (error) {
-      if (error instanceof Error && 'code' in error && (error as any).code === "ENOENT") {
-        return { entities: [], relations: [] };
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return {
+          graph: { entities: [], relations: [] },
+          unreadable: [],
+          size: { entities: 0, relations: 0, bytes: 0 },
+        };
       }
       throw error;
     }
   }
 
-  private async saveGraph(graph: KnowledgeGraph): Promise<void> {
-    const lines = [
-      ...graph.entities.map(e => JSON.stringify({
-        type: "entity",
-        name: e.name,
-        entityType: e.entityType,
-        observations: e.observations
-      })),
-      ...graph.relations.map(r => JSON.stringify({
-        type: "relation",
-        from: r.from,
-        to: r.to,
-        relationType: r.relationType
-      })),
+  // Record the members of a valid stored record that are neither its type nor
+  // a field of its schema, for saveGraph to write back. Object.fromEntries
+  // defines each key as an own property, so even a "__proto__" member stays
+  // data rather than setting the object's prototype.
+  private keepExtraFields(
+    parsed: object,
+    record: Record<string, unknown>,
+    shape: Record<string, unknown>,
+  ): void {
+    const extras = Object.entries(record).filter(
+      ([key]) => key !== "type" && !Object.hasOwn(shape, key),
+    );
+    if (extras.length > 0) {
+      this.extraFields.set(parsed, Object.fromEntries(extras));
+    }
+  }
+
+  // Refuse a write that would leave the graph over a limit and larger than it
+  // was (`before`), on any one dimension. Comparing against `before` keeps a
+  // graph already over a lowered limit usable: a call that adds nothing still
+  // succeeds, and the delete tools, which never pass `before`, can always
+  // shrink it. The refusal is thrown before anything is written, so the call
+  // changes nothing.
+  private checkLimits(
+    graph: KnowledgeGraph,
+    content: string,
+    before: GraphSize,
+  ): void {
+    const after: GraphSize = {
+      entities: graph.entities.length,
+      relations: graph.relations.length,
+      bytes: Buffer.byteLength(content, "utf-8"),
+    };
+    const dimensions: [keyof GraphSize, keyof GraphLimits, string][] = [
+      ["entities", "maxEntities", "entities"],
+      ["relations", "maxRelations", "relations"],
+      ["bytes", "maxFileBytes", "bytes in the memory file"],
     ];
-    await fs.writeFile(this.memoryFilePath, lines.join("\n"));
+    for (const [dimension, key, unit] of dimensions) {
+      const limit = this.limits[key];
+      if (
+        limit !== undefined &&
+        after[dimension] > limit &&
+        after[dimension] > before[dimension]
+      ) {
+        throw new Error(
+          `Refused: this change would bring the knowledge graph to ${after[dimension]} ${unit}, ` +
+            `over the limit of ${limit} set by ${GRAPH_LIMIT_ENV[key]}. Nothing was saved. ` +
+            "Delete entities, relations or observations that are no longer needed to make room, " +
+            `or ask the operator to raise ${GRAPH_LIMIT_ENV[key]}.`,
+        );
+      }
+    }
+  }
+
+  // before is the graph's size as loaded; the write tools that add to the
+  // graph pass it, so the save is refused if it breaks a limit (checkLimits).
+  private async saveGraph(
+    graph: KnowledgeGraph,
+    unreadable: string[],
+    before?: GraphSize,
+  ): Promise<void> {
+    // The modelled fields come first and always hold the current values; a
+    // record's extras (see extraFields) follow unchanged. A record created by
+    // this write has none and is written exactly as before.
+    const lines = [
+      ...graph.entities.map((e) =>
+        JSON.stringify({
+          type: "entity",
+          name: e.name,
+          entityType: e.entityType,
+          observations: e.observations,
+          ...this.extraFields.get(e),
+        }),
+      ),
+      ...graph.relations.map((r) =>
+        JSON.stringify({
+          type: "relation",
+          from: r.from,
+          to: r.to,
+          relationType: r.relationType,
+          ...this.extraFields.get(r),
+        }),
+      ),
+      ...unreadable,
+    ];
+    const content = lines.join("\n") + "\n";
+    if (before) {
+      this.checkLimits(graph, content, before);
+    }
+
+    // Write to a temporary file in the same directory, then rename it over
+    // the target. fs.writeFile would truncate the memory file before writing,
+    // so an interruption (SIGKILL, container stop, OOM, power loss) would
+    // leave the only copy of the graph truncated and unrecoverable.
+    // rename(2) is atomic on POSIX filesystems: readers see either the
+    // complete old file or the complete new one, never a partial state.
+    // The temp file is kept in the same directory so the rename stays on one
+    // filesystem — renaming across mount points fails with EXDEV.
+    //
+    // The rename also replaces the graph file's inode, and a new file takes
+    // the process umask, so the file's own mode would be lost (#4827): an
+    // operator's 0600 would come back 0644, and a read-only file would be
+    // silently replaced, since rename(2) needs only a writable directory.
+    // So refuse a graph file this process may not write, as fs.writeFile
+    // would (EACCES), and give the temp file the existing file's permission
+    // bits before the rename, as src/filesystem/lib.ts preserves them for
+    // the same write pattern. A graph file that does not exist yet has
+    // nothing to preserve.
+    let mode: number | undefined;
+    try {
+      await fs.access(this.memoryFilePath, fs.constants.W_OK);
+      mode = (await fs.stat(this.memoryFilePath)).mode & 0o777;
+    } catch (error) {
+      if (
+        !(error instanceof Error && "code" in error && error.code === "ENOENT")
+      ) {
+        throw error;
+      }
+    }
+
+    const directory = path.dirname(this.memoryFilePath);
+    const tempFilePath = path.join(
+      directory,
+      `${path.basename(this.memoryFilePath)}.${randomBytes(16).toString("hex")}.tmp`,
+    );
+
+    // The directory may be writable by others, so anything can appear at
+    // the temp file's name while the save runs. Create it exclusively ("wx",
+    // O_CREAT | O_EXCL), which fails rather than open whatever is already
+    // there, a symlink included, and then write and chmod it only through
+    // the handle, which keeps reaching the file this call created whatever
+    // happens to the name. Only the rename has to go by name.
+    let handle: FileHandle | undefined;
+    try {
+      // Create the temp file with the existing mode, so the graph is never
+      // readable through it more widely than through the file it replaces;
+      // the umask can only narrow that. The chmod then restores any bits the
+      // umask removed.
+      handle = await fs.open(tempFilePath, "wx", mode);
+      await handle.writeFile(content);
+      if (mode !== undefined) {
+        await handle.chmod(mode);
+      }
+      // The rename moves whatever the name holds now, onto the graph path,
+      // so refuse unless that is still the file written above. Compare while
+      // the handle is open: the open file's inode number cannot be reused by
+      // another file until it is closed.
+      const written = await handle.stat({ bigint: true });
+      const named = await fs.lstat(tempFilePath, { bigint: true });
+      if (named.ino !== written.ino || named.dev !== written.dev) {
+        throw new Error(
+          `Refused to save: ${tempFilePath} was replaced while the graph was ` +
+            "being written to it. Nothing was saved.",
+        );
+      }
+      await handle.close();
+      handle = undefined;
+      await fs.rename(tempFilePath, this.memoryFilePath);
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      // Never leave a stray temp file behind on failure. When the name was
+      // replaced this removes the replacement, never what a link points at.
+      await fs.unlink(tempFilePath).catch(() => {});
+      throw error;
+    }
   }
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
-    const graph = await this.loadGraph();
-    const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
-    graph.entities.push(...newEntities);
-    await this.saveGraph(graph);
-    return newEntities;
+    return this.withLock(async () => {
+      const { graph, unreadable, size } = await this.loadGraphWithUnreadable();
+      const newEntities = entities.filter(
+        (e, index) =>
+          !graph.entities.some(
+            (existingEntity) => existingEntity.name === e.name,
+          ) &&
+          // Also skip duplicates appearing earlier in this same batch
+          !entities.slice(0, index).some((earlier) => earlier.name === e.name),
+      );
+      graph.entities.push(...newEntities);
+      // Only a call that adds something is held to the limits: re-saving can
+      // grow an existing file that was not written in this exact form.
+      await this.saveGraph(
+        graph,
+        unreadable,
+        newEntities.length > 0 ? size : undefined,
+      );
+      return newEntities;
+    });
   }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
-    const graph = await this.loadGraph();
-    const newRelations = relations.filter(r => !graph.relations.some(existingRelation => 
-      existingRelation.from === r.from && 
-      existingRelation.to === r.to && 
-      existingRelation.relationType === r.relationType
-    ));
-    graph.relations.push(...newRelations);
-    await this.saveGraph(graph);
-    return newRelations;
-  }
+    return this.withLock(async () => {
+      const { graph, unreadable, size } = await this.loadGraphWithUnreadable();
+      const entityNames = new Set(graph.entities.map((e) => e.name));
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
-    const graph = await this.loadGraph();
-    const results = observations.map(o => {
-      const entity = graph.entities.find(e => e.name === o.entityName);
-      if (!entity) {
-        throw new Error(`Entity with name ${o.entityName} not found`);
-      }
-      const newObservations = o.contents.filter(content => !entity.observations.includes(content));
-      entity.observations.push(...newObservations);
-      return { entityName: o.entityName, addedObservations: newObservations };
+      relations.forEach((r) => {
+        if (!entityNames.has(r.from)) {
+          throw new Error(`Entity with name ${r.from} not found`);
+        }
+        if (!entityNames.has(r.to)) {
+          throw new Error(`Entity with name ${r.to} not found`);
+        }
+      });
+
+      const isSameRelation = (a: Relation, b: Relation) =>
+        a.from === b.from && a.to === b.to && a.relationType === b.relationType;
+      const newRelations = relations.filter(
+        (r, index) =>
+          !graph.relations.some((existingRelation) =>
+            isSameRelation(existingRelation, r),
+          ) &&
+          // Also skip duplicates appearing earlier in this same batch
+          !relations
+            .slice(0, index)
+            .some((earlier) => isSameRelation(earlier, r)),
+      );
+      graph.relations.push(...newRelations);
+      // Held to the limits only when it adds something (see createEntities).
+      await this.saveGraph(
+        graph,
+        unreadable,
+        newRelations.length > 0 ? size : undefined,
+      );
+      return newRelations;
     });
-    await this.saveGraph(graph);
-    return results;
   }
 
-  async deleteEntities(entityNames: string[]): Promise<void> {
-    const graph = await this.loadGraph();
-    graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
-    graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
-    await this.saveGraph(graph);
-  }
-
-  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
-    const graph = await this.loadGraph();
-    deletions.forEach(d => {
-      const entity = graph.entities.find(e => e.name === d.entityName);
-      if (entity) {
-        entity.observations = entity.observations.filter(o => !d.observations.includes(o));
-      }
+  async addObservations(
+    observations: { entityName: string; contents: string[] }[],
+  ): Promise<{ entityName: string; addedObservations: string[] }[]> {
+    return this.withLock(async () => {
+      const { graph, unreadable, size } = await this.loadGraphWithUnreadable();
+      const results = observations.map((o) => {
+        const entity = graph.entities.find((e) => e.name === o.entityName);
+        if (!entity) {
+          throw new Error(`Entity with name ${o.entityName} not found`);
+        }
+        // A Set keeps the first occurrence of each string, so a repeat within
+        // one call is stored and reported once (#5201).
+        const newObservations = [...new Set(o.contents)].filter(
+          (content) => !entity.observations.includes(content),
+        );
+        entity.observations.push(...newObservations);
+        return { entityName: o.entityName, addedObservations: newObservations };
+      });
+      // Held to the limits only when it adds something (see createEntities).
+      const added = results.some((r) => r.addedObservations.length > 0);
+      await this.saveGraph(graph, unreadable, added ? size : undefined);
+      return results;
     });
-    await this.saveGraph(graph);
   }
 
-  async deleteRelations(relations: Relation[]): Promise<void> {
+  async deleteEntities(
+    entityNames: string[],
+  ): Promise<{ deleted: string[]; notFound: string[] }> {
+    return this.withLock(async () => {
+      const { graph, unreadable } = await this.loadGraphWithUnreadable();
+      const present = new Set(graph.entities.map((e) => e.name));
+      const deleted = entityNames.filter((name) => present.has(name));
+      const notFound = entityNames.filter((name) => !present.has(name));
+      graph.entities = graph.entities.filter(
+        (e) => !entityNames.includes(e.name),
+      );
+      graph.relations = graph.relations.filter(
+        (r) => !entityNames.includes(r.from) && !entityNames.includes(r.to),
+      );
+      await this.saveGraph(graph, unreadable);
+      return { deleted, notFound };
+    });
+  }
+
+  async deleteObservations(
+    deletions: { entityName: string; observations: string[] }[],
+  ): Promise<{ deletedCount: number; missingEntities: string[] }> {
+    return this.withLock(async () => {
+      const { graph, unreadable } = await this.loadGraphWithUnreadable();
+      let deletedCount = 0;
+      const missingEntities: string[] = [];
+      deletions.forEach((d) => {
+        const entity = graph.entities.find((e) => e.name === d.entityName);
+        if (entity) {
+          const before = entity.observations.length;
+          entity.observations = entity.observations.filter(
+            (o) => !d.observations.includes(o),
+          );
+          deletedCount += before - entity.observations.length;
+        } else {
+          missingEntities.push(d.entityName);
+        }
+      });
+      await this.saveGraph(graph, unreadable);
+      return { deletedCount, missingEntities };
+    });
+  }
+
+  async deleteRelations(
+    relations: Relation[],
+  ): Promise<{ deletedCount: number }> {
+    return this.withLock(async () => {
+      const { graph, unreadable } = await this.loadGraphWithUnreadable();
+      const before = graph.relations.length;
+      graph.relations = graph.relations.filter(
+        (r) =>
+          !relations.some(
+            (delRelation) =>
+              r.from === delRelation.from &&
+              r.to === delRelation.to &&
+              r.relationType === delRelation.relationType,
+          ),
+      );
+      await this.saveGraph(graph, unreadable);
+      return { deletedCount: before - graph.relations.length };
+    });
+  }
+
+  // With no options, the whole graph, as the knowledge-graph resource serves
+  // it. entityTypes keeps only entities of those types, and the relations
+  // that touch one of them; observationLimit caps each entity's observations
+  // (see limitObservations).
+  async readGraph(options: ReadGraphOptions = {}): Promise<ReadGraphResult> {
     const graph = await this.loadGraph();
-    graph.relations = graph.relations.filter(r => !relations.some(delRelation => 
-      r.from === delRelation.from && 
-      r.to === delRelation.to && 
-      r.relationType === delRelation.relationType
-    ));
-    await this.saveGraph(graph);
-  }
-
-  async readGraph(): Promise<KnowledgeGraph> {
-    return this.loadGraph();
-  }
-
-  // Very basic search function
-  async searchNodes(query: string): Promise<KnowledgeGraph> {
-    const graph = await this.loadGraph();
-    
-    // Filter entities
-    const filteredEntities = graph.entities.filter(e => 
-      e.name.toLowerCase().includes(query.toLowerCase()) ||
-      e.entityType.toLowerCase().includes(query.toLowerCase()) ||
-      e.observations.some(o => o.toLowerCase().includes(query.toLowerCase()))
+    const { entityTypes, observationLimit } = options;
+    if (entityTypes === undefined) {
+      return {
+        entities: limitObservations(graph.entities, observationLimit),
+        relations: graph.relations,
+      };
+    }
+    const entities = graph.entities.filter((e) =>
+      entityTypes.includes(e.entityType),
     );
-  
+    const names = new Set(entities.map((e) => e.name));
+    return {
+      entities: limitObservations(entities, observationLimit),
+      relations: graph.relations.filter(
+        (r) => names.has(r.from) || names.has(r.to),
+      ),
+    };
+  }
+
+  // Very basic search function. limit keeps the first matches in stored
+  // order; observationLimit caps each entity's observations.
+  async searchNodes(
+    query: string,
+    options: SearchNodesOptions = {},
+  ): Promise<ReadGraphResult> {
+    const graph = await this.loadGraph();
+
+    // Filter entities
+    const filteredEntities = graph.entities
+      .filter(
+        (e) =>
+          e.name.toLowerCase().includes(query.toLowerCase()) ||
+          e.entityType.toLowerCase().includes(query.toLowerCase()) ||
+          e.observations.some((o) =>
+            o.toLowerCase().includes(query.toLowerCase()),
+          ),
+      )
+      .slice(0, options.limit);
+
     // Create a Set of filtered entity names for quick lookup
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-  
+    const filteredEntityNames = new Set(filteredEntities.map((e) => e.name));
+
     // Include relations where at least one endpoint matches the search results.
     // This lets callers discover connections to nodes outside the result set.
-    const filteredRelations = graph.relations.filter(r => 
-      filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
+    const filteredRelations = graph.relations.filter(
+      (r) => filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to),
     );
-  
-    const filteredGraph: KnowledgeGraph = {
-      entities: filteredEntities,
+
+    return {
+      entities: limitObservations(filteredEntities, options.observationLimit),
       relations: filteredRelations,
     };
-  
-    return filteredGraph;
   }
 
-  async openNodes(names: string[]): Promise<KnowledgeGraph> {
+  async openNodes(
+    names: string[],
+    options: OpenNodesOptions = {},
+  ): Promise<ReadGraphResult> {
     const graph = await this.loadGraph();
-    
+
     // Filter entities
-    const filteredEntities = graph.entities.filter(e => names.includes(e.name));
-  
+    const filteredEntities = graph.entities.filter((e) =>
+      names.includes(e.name),
+    );
+
     // Create a Set of filtered entity names for quick lookup
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-  
+    const filteredEntityNames = new Set(filteredEntities.map((e) => e.name));
+
     // Include relations where at least one endpoint is in the requested set.
     // Previously this required BOTH endpoints, which meant relations from a
     // requested node to an unrequested node were silently dropped — making it
     // impossible to discover a node's connections without reading the full graph.
-    const filteredRelations = graph.relations.filter(r => 
-      filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to)
+    const filteredRelations = graph.relations.filter(
+      (r) => filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to),
     );
-  
-    const filteredGraph: KnowledgeGraph = {
-      entities: filteredEntities,
+
+    return {
+      entities: limitObservations(filteredEntities, options.observationLimit),
       relations: filteredRelations,
     };
-  
-    return filteredGraph;
   }
 }
 
-let knowledgeGraphManager: KnowledgeGraphManager;
+// Options of the read tools (#3953), all optional, so a call without them
+// returns what it always has. They let a client read a large graph in
+// pieces: an overview of names, types and observation counts first
+// (observationLimit 0), then the entities it needs in full.
+export interface OpenNodesOptions {
+  observationLimit?: number;
+}
+
+export interface ReadGraphOptions extends OpenNodesOptions {
+  entityTypes?: string[];
+}
+
+export interface SearchNodesOptions extends OpenNodesOptions {
+  limit?: number;
+}
+
+// An entity as a read tool returns it. observationCount is set only when
+// observationLimit was given, so a count above observations.length tells the
+// caller that observations were left out.
+export interface ReadEntity extends Entity {
+  observationCount?: number;
+}
+
+export interface ReadGraphResult {
+  entities: ReadEntity[];
+  relations: Relation[];
+}
+
+// Keep each entity's first observationLimit observations, in the order they
+// were added, and record how many it holds. Without a limit the entities are
+// returned as they are.
+function limitObservations(
+  entities: Entity[],
+  observationLimit: number | undefined,
+): ReadEntity[] {
+  if (observationLimit === undefined) {
+    return entities;
+  }
+  return entities.map((e) => ({
+    name: e.name,
+    entityType: e.entityType,
+    observations: e.observations.slice(0, observationLimit),
+    observationCount: e.observations.length,
+  }));
+}
 
 // Zod schemas for entities and relations
 const EntitySchema = z.object({
   name: z.string().describe("The name of the entity"),
   entityType: z.string().describe("The type of the entity"),
-  observations: z.array(z.string()).describe("An array of observation contents associated with the entity")
+  observations: z
+    .array(z.string())
+    .describe("An array of observation contents associated with the entity"),
 });
 
 const RelationSchema = z.object({
   from: z.string().describe("The name of the entity where the relation starts"),
   to: z.string().describe("The name of the entity where the relation ends"),
-  relationType: z.string().describe("The type of the relation")
+  relationType: z.string().describe("The type of the relation"),
 });
 
-// The server instance and tools exposed to Claude
-const server = new McpServer({
-  name: "memory-server",
-  version: "0.6.3",
+export const RESOURCE_URI = "memory://knowledge-graph";
+
+export const SEARCH_QUERY_MAX_LENGTH = 2048;
+
+export const SearchNodesQuerySchema = z
+  .string()
+  .max(SEARCH_QUERY_MAX_LENGTH)
+  .describe(
+    "The search query to match against entity names, types, and observation content",
+  );
+
+// The read tools' optional inputs (#3953). Their descriptions carry the
+// guidance on when to use them, so the tool descriptions need not.
+const ObservationLimitSchema = z
+  .number()
+  .int()
+  .min(0)
+  .optional()
+  .describe(
+    "Return at most this many observations per entity (the first ones, in the order they were added) and add each entity's total as observationCount. Use 0 for names, types and counts only: a cheap overview of a large graph, after which open_nodes reads the entities you need in full. Omit to return every observation.",
+  );
+
+const ReadGraphEntityTypesSchema = z
+  .array(z.string())
+  .min(1)
+  .optional()
+  .describe(
+    "Return only entities whose entityType is one of these (exact match), and only the relations that touch one of them. Omit to return every entity.",
+  );
+
+const SearchNodesLimitSchema = z
+  .number()
+  .int()
+  .min(1)
+  .optional()
+  .describe(
+    "Return at most this many matching entities (the first matches, in stored order), with the relations that touch them. Omit to return every match.",
+  );
+
+// An entity in a read tool's result: observationCount appears only when the
+// call gave observationLimit.
+const ReadEntitySchema = EntitySchema.extend({
+  observationCount: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "How many observations the entity holds in total; present only when observationLimit was given",
+    ),
 });
 
-const RESOURCE_URI = "memory://knowledge-graph";
+// Build a memory server over the graph file at memoryFilePath: the nine
+// tools, the knowledge-graph resource and its subscriptions. main() serves the
+// result on stdio; tests connect it to an in-memory transport, so each call
+// returns an independent server with its own subscriber set. `era` is the
+// protocol era the instance will serve, which decides how graph changes are
+// announced (see notifyGraphUpdated). `publishGraphUpdated`, when given,
+// announces every change instead of the instance itself, whatever era wrote
+// it: over HTTP each request gets a fresh server that holds no listen stream
+// and no subscriber, so http.ts hands in the handler's subscription bus, which
+// every open 2026-07-28 stream listens on. `limits` caps how large the write
+// tools may grow the graph; main() and run() read it from the environment.
+export function createServer(
+  memoryFilePath: string,
+  era: "legacy" | "modern" = "legacy",
+  publishGraphUpdated?: () => void,
+  limits: GraphLimits = {},
+): McpServer {
+  const knowledgeGraphManager = new KnowledgeGraphManager(
+    memoryFilePath,
+    {},
+    limits,
+  );
 
-// Track which resource URIs the connected client has subscribed to, so we only
-// emit notifications/resources/updated to a client that asked for them.
-const resourceSubscribers = new Set<string>();
+  const server = new McpServer({
+    name: "memory-server",
+    version: SERVER_VERSION,
+  });
 
-// Notify subscribers that the knowledge graph resource changed. No-op when the
-// client has not subscribed.
-function notifyGraphUpdated() {
-  if (resourceSubscribers.has(RESOURCE_URI)) {
-    server.server.sendResourceUpdated({ uri: RESOURCE_URI });
+  // Track which resource URIs the connected client has subscribed to, so we only
+  // emit notifications/resources/updated to a client that asked for them.
+  const resourceSubscribers = new Set<string>();
+
+  // Notify subscribers that the knowledge graph resource changed. A 2025-era
+  // client subscribes with resources/subscribe, so the notification is sent
+  // only once it has. On 2026-07-28 that method does not exist: a client asks
+  // for updates in its subscriptions/listen filter, and serveStdio delivers
+  // the notification only to a listen stream that named the URI, so it is
+  // always handed over.
+  function notifyGraphUpdated() {
+    if (publishGraphUpdated) {
+      publishGraphUpdated();
+    } else if (era === "modern" || resourceSubscribers.has(RESOURCE_URI)) {
+      // Fire-and-forget: the tool result must not wait on (or fail because of)
+      // the notification, so a delivery failure is logged rather than thrown.
+      server.server
+        .sendResourceUpdated({ uri: RESOURCE_URI })
+        .catch((error: unknown) => {
+          console.error("Failed to send resource updated notification:", error);
+        });
+    }
   }
+
+  // Register create_entities tool
+  server.registerTool(
+    "create_entities",
+    {
+      title: "Create Entities",
+      description:
+        "Create multiple new entities in the knowledge graph. An entity whose name already exists, or repeats an earlier entity in the same call, is skipped and its observations are not added; the result lists the skipped names in `skipped`. Use add_observations to add observations to an existing entity.",
+      inputSchema: z.object({
+        entities: z
+          .array(EntitySchema)
+          .describe(
+            "The entities to create, each with a name unique in the graph",
+          ),
+      }),
+      outputSchema: z.object({
+        entities: z.array(EntitySchema),
+        // Present only when at least one requested entity was skipped.
+        skipped: z.array(z.string()).optional(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ entities }) => {
+      const result = await knowledgeGraphManager.createEntities(entities);
+      notifyGraphUpdated();
+      // Existing names are ignored (see README). Say so: otherwise an agent
+      // reads the response as its observations having been stored.
+      const skipped = skippedEntityNames(entities, result);
+      const content = [
+        { type: "text" as const, text: JSON.stringify(result, null, 2) },
+      ];
+      if (skipped.length > 0) {
+        content.push({
+          type: "text" as const,
+          text: skippedEntitiesNotice(skipped),
+        });
+      }
+      return {
+        content,
+        structuredContent:
+          skipped.length > 0
+            ? { entities: result, skipped }
+            : { entities: result },
+      };
+    },
+  );
+
+  // Register create_relations tool
+  server.registerTool(
+    "create_relations",
+    {
+      title: "Create Relations",
+      description:
+        "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice",
+      inputSchema: z.object({
+        relations: z
+          .array(RelationSchema)
+          .describe(
+            "The relations to create. Both ends must name existing entities; a relation already in the graph is not added again",
+          ),
+      }),
+      outputSchema: z.object({
+        relations: z.array(RelationSchema),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ relations }) => {
+      const result = await knowledgeGraphManager.createRelations(relations);
+      notifyGraphUpdated();
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+        structuredContent: { relations: result },
+      };
+    },
+  );
+
+  // Register add_observations tool
+  server.registerTool(
+    "add_observations",
+    {
+      title: "Add Observations",
+      description:
+        "Add new observations to existing entities in the knowledge graph",
+      inputSchema: z.object({
+        observations: z
+          .array(
+            z.object({
+              entityName: z
+                .string()
+                .describe("The name of the entity to add the observations to"),
+              contents: z
+                .array(z.string())
+                .describe("An array of observation contents to add"),
+            }),
+          )
+          .describe(
+            "The observations to add, grouped by entity. Each entity must already exist; an observation it already has is not added again",
+          ),
+      }),
+      outputSchema: z.object({
+        results: z.array(
+          z.object({
+            entityName: z.string(),
+            addedObservations: z.array(z.string()),
+          }),
+        ),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ observations }) => {
+      const result = await knowledgeGraphManager.addObservations(observations);
+      notifyGraphUpdated();
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+        structuredContent: { results: result },
+      };
+    },
+  );
+
+  // Register delete_entities tool
+  server.registerTool(
+    "delete_entities",
+    {
+      title: "Delete Entities",
+      description:
+        "Delete whole entities from the knowledge graph, together with every relation that points to or from them and all their observations. Use it only to remove an entity entirely; to remove a link between two entities and keep both, use delete_relations, and to remove facts from an entity, use delete_observations. Cannot be undone.",
+      inputSchema: z.object({
+        entityNames: z
+          .array(z.string())
+          .describe("An array of entity names to delete"),
+      }),
+      outputSchema: z.object({
+        success: z.boolean(),
+        message: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ entityNames }) => {
+      const { deleted, notFound } =
+        await knowledgeGraphManager.deleteEntities(entityNames);
+      notifyGraphUpdated();
+      const message =
+        notFound.length === 0
+          ? "Entities deleted successfully"
+          : `Deleted ${deleted.length} of ${entityNames.length} entities. Not found: ${notFound.join(", ")}`;
+      return {
+        content: [{ type: "text" as const, text: message }],
+        structuredContent: { success: true, message },
+      };
+    },
+  );
+
+  // Register delete_observations tool
+  server.registerTool(
+    "delete_observations",
+    {
+      title: "Delete Observations",
+      description:
+        "Delete specific observations from entities in the knowledge graph",
+      inputSchema: z.object({
+        deletions: z
+          .array(
+            z.object({
+              entityName: z
+                .string()
+                .describe("The name of the entity containing the observations"),
+              observations: z
+                .array(z.string())
+                .describe("An array of observations to delete"),
+            }),
+          )
+          .describe(
+            "The observations to delete, grouped by entity, each matched by its exact text",
+          ),
+      }),
+      outputSchema: z.object({
+        success: z.boolean(),
+        message: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ deletions }) => {
+      const { deletedCount, missingEntities } =
+        await knowledgeGraphManager.deleteObservations(deletions);
+      notifyGraphUpdated();
+      const requested = deletions.reduce(
+        (total, d) => total + d.observations.length,
+        0,
+      );
+      const message =
+        deletedCount === requested
+          ? "Observations deleted successfully"
+          : `Deleted ${deletedCount} of ${requested} observations.` +
+            (missingEntities.length
+              ? ` Entities not found: ${missingEntities.join(", ")}`
+              : "");
+      return {
+        content: [{ type: "text" as const, text: message }],
+        structuredContent: { success: true, message },
+      };
+    },
+  );
+
+  // Register delete_relations tool
+  server.registerTool(
+    "delete_relations",
+    {
+      title: "Delete Relations",
+      description:
+        "Delete specific relations (from, to, relationType) from the knowledge graph and keep the entities they connect. Each relation must match an existing one exactly on all three fields; if unsure, call open_nodes (or search_nodes) first to read the stored relationType. Use it to remove a link between two entities; to remove an entity itself, use delete_entities. Cannot be undone.",
+      inputSchema: z.object({
+        relations: z
+          .array(RelationSchema)
+          .describe("An array of relations to delete"),
+      }),
+      outputSchema: z.object({
+        success: z.boolean(),
+        message: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ relations }) => {
+      const { deletedCount } =
+        await knowledgeGraphManager.deleteRelations(relations);
+      notifyGraphUpdated();
+      const message =
+        deletedCount === relations.length
+          ? "Relations deleted successfully"
+          : `Deleted ${deletedCount} of ${relations.length} relations. The rest matched nothing.`;
+      return {
+        content: [{ type: "text" as const, text: message }],
+        structuredContent: { success: true, message },
+      };
+    },
+  );
+
+  // Register read_graph tool
+  server.registerTool(
+    "read_graph",
+    {
+      title: "Read Graph",
+      description:
+        "Read the entire knowledge graph: every entity with its observations, and every relation. The result grows with the graph, so use this only when you need everything; prefer search_nodes to find entities by keyword and open_nodes to read entities whose names you know.",
+      inputSchema: z.object({
+        entityTypes: ReadGraphEntityTypesSchema,
+        observationLimit: ObservationLimitSchema,
+      }),
+      outputSchema: z.object({
+        entities: z.array(ReadEntitySchema),
+        relations: z.array(RelationSchema),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ entityTypes, observationLimit }) => {
+      const graph = await knowledgeGraphManager.readGraph({
+        entityTypes,
+        observationLimit,
+      });
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(graph, null, 2) },
+        ],
+        structuredContent: { ...graph },
+      };
+    },
+  );
+
+  // Register search_nodes tool
+  server.registerTool(
+    "search_nodes",
+    {
+      title: "Search Nodes",
+      description:
+        "Search the knowledge graph for entities whose name, type or observations contain the query (case-insensitive). Use this when you have a keyword, a topic or part of a name but not the exact entity names. Prefer open_nodes when you already know the exact names, and use read_graph only when you need the whole graph. Returns the matching entities and every relation that touches one of them.",
+      inputSchema: z.object({
+        query: SearchNodesQuerySchema,
+        limit: SearchNodesLimitSchema,
+        observationLimit: ObservationLimitSchema,
+      }),
+      outputSchema: z.object({
+        entities: z.array(ReadEntitySchema),
+        relations: z.array(RelationSchema),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ query, limit, observationLimit }) => {
+      const graph = await knowledgeGraphManager.searchNodes(query, {
+        limit,
+        observationLimit,
+      });
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(graph, null, 2) },
+        ],
+        structuredContent: { ...graph },
+      };
+    },
+  );
+
+  // Register open_nodes tool
+  server.registerTool(
+    "open_nodes",
+    {
+      title: "Open Nodes",
+      description:
+        "Retrieve specific entities by their exact names, with every relation that touches one of them. Use this when you already know the names (from the conversation, or from an earlier search_nodes or read_graph result); it is the cheapest way to read entities you can name. Prefer search_nodes when you only have a keyword or part of a name. Names that do not exist are skipped.",
+      inputSchema: z.object({
+        names: z
+          .array(z.string())
+          .describe("An array of entity names to retrieve"),
+        observationLimit: ObservationLimitSchema,
+      }),
+      outputSchema: z.object({
+        entities: z.array(ReadEntitySchema),
+        relations: z.array(RelationSchema),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ names, observationLimit }) => {
+      const graph = await knowledgeGraphManager.openNodes(names, {
+        observationLimit,
+      });
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(graph, null, 2) },
+        ],
+        structuredContent: { ...graph },
+      };
+    },
+  );
+
+  registerKnowledgeGraphResource(server, knowledgeGraphManager);
+  registerKnowledgeGraphSubscriptions(server, resourceSubscribers);
+
+  return server;
 }
-
-// Register create_entities tool
-server.registerTool(
-  "create_entities",
-  {
-    title: "Create Entities",
-    description: "Create multiple new entities in the knowledge graph",
-    inputSchema: {
-      entities: z.array(EntitySchema)
-    },
-    outputSchema: {
-      entities: z.array(EntitySchema)
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: false,
-      openWorldHint: false,
-    }
-  },
-  async ({ entities }) => {
-    const result = await knowledgeGraphManager.createEntities(entities);
-    notifyGraphUpdated();
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      structuredContent: { entities: result }
-    };
-  }
-);
-
-// Register create_relations tool
-server.registerTool(
-  "create_relations",
-  {
-    title: "Create Relations",
-    description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice",
-    inputSchema: {
-      relations: z.array(RelationSchema)
-    },
-    outputSchema: {
-      relations: z.array(RelationSchema)
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: false,
-      openWorldHint: false,
-    }
-  },
-  async ({ relations }) => {
-    const result = await knowledgeGraphManager.createRelations(relations);
-    notifyGraphUpdated();
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      structuredContent: { relations: result }
-    };
-  }
-);
-
-// Register add_observations tool
-server.registerTool(
-  "add_observations",
-  {
-    title: "Add Observations",
-    description: "Add new observations to existing entities in the knowledge graph",
-    inputSchema: {
-      observations: z.array(z.object({
-        entityName: z.string().describe("The name of the entity to add the observations to"),
-        contents: z.array(z.string()).describe("An array of observation contents to add")
-      }))
-    },
-    outputSchema: {
-      results: z.array(z.object({
-        entityName: z.string(),
-        addedObservations: z.array(z.string())
-      }))
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: false,
-      openWorldHint: false,
-    }
-  },
-  async ({ observations }) => {
-    const result = await knowledgeGraphManager.addObservations(observations);
-    notifyGraphUpdated();
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      structuredContent: { results: result }
-    };
-  }
-);
-
-// Register delete_entities tool
-server.registerTool(
-  "delete_entities",
-  {
-    title: "Delete Entities",
-    description: "Delete multiple entities and their associated relations from the knowledge graph",
-    inputSchema: {
-      entityNames: z.array(z.string()).describe("An array of entity names to delete")
-    },
-    outputSchema: {
-      success: z.boolean(),
-      message: z.string()
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: true,
-      openWorldHint: false,
-    }
-  },
-  async ({ entityNames }) => {
-    await knowledgeGraphManager.deleteEntities(entityNames);
-    notifyGraphUpdated();
-    return {
-      content: [{ type: "text" as const, text: "Entities deleted successfully" }],
-      structuredContent: { success: true, message: "Entities deleted successfully" }
-    };
-  }
-);
-
-// Register delete_observations tool
-server.registerTool(
-  "delete_observations",
-  {
-    title: "Delete Observations",
-    description: "Delete specific observations from entities in the knowledge graph",
-    inputSchema: {
-      deletions: z.array(z.object({
-        entityName: z.string().describe("The name of the entity containing the observations"),
-        observations: z.array(z.string()).describe("An array of observations to delete")
-      }))
-    },
-    outputSchema: {
-      success: z.boolean(),
-      message: z.string()
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: true,
-      openWorldHint: false,
-    }
-  },
-  async ({ deletions }) => {
-    await knowledgeGraphManager.deleteObservations(deletions);
-    notifyGraphUpdated();
-    return {
-      content: [{ type: "text" as const, text: "Observations deleted successfully" }],
-      structuredContent: { success: true, message: "Observations deleted successfully" }
-    };
-  }
-);
-
-// Register delete_relations tool
-server.registerTool(
-  "delete_relations",
-  {
-    title: "Delete Relations",
-    description: "Delete multiple relations from the knowledge graph",
-    inputSchema: {
-      relations: z.array(RelationSchema).describe("An array of relations to delete")
-    },
-    outputSchema: {
-      success: z.boolean(),
-      message: z.string()
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: true,
-      openWorldHint: false,
-    }
-  },
-  async ({ relations }) => {
-    await knowledgeGraphManager.deleteRelations(relations);
-    notifyGraphUpdated();
-    return {
-      content: [{ type: "text" as const, text: "Relations deleted successfully" }],
-      structuredContent: { success: true, message: "Relations deleted successfully" }
-    };
-  }
-);
-
-// Register read_graph tool
-server.registerTool(
-  "read_graph",
-  {
-    title: "Read Graph",
-    description: "Read the entire knowledge graph",
-    inputSchema: {},
-    outputSchema: {
-      entities: z.array(EntitySchema),
-      relations: z.array(RelationSchema)
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    }
-  },
-  async () => {
-    const graph = await knowledgeGraphManager.readGraph();
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
-      structuredContent: { ...graph }
-    };
-  }
-);
-
-// Register search_nodes tool
-server.registerTool(
-  "search_nodes",
-  {
-    title: "Search Nodes",
-    description: "Search for nodes in the knowledge graph based on a query",
-    inputSchema: {
-      query: z.string().describe("The search query to match against entity names, types, and observation content")
-    },
-    outputSchema: {
-      entities: z.array(EntitySchema),
-      relations: z.array(RelationSchema)
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    }
-  },
-  async ({ query }) => {
-    const graph = await knowledgeGraphManager.searchNodes(query);
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
-      structuredContent: { ...graph }
-    };
-  }
-);
-
-// Register open_nodes tool
-server.registerTool(
-  "open_nodes",
-  {
-    title: "Open Nodes",
-    description: "Open specific nodes in the knowledge graph by their names",
-    inputSchema: {
-      names: z.array(z.string()).describe("An array of entity names to retrieve")
-    },
-    outputSchema: {
-      entities: z.array(EntitySchema),
-      relations: z.array(RelationSchema)
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    }
-  },
-  async ({ names }) => {
-    const graph = await knowledgeGraphManager.openNodes(names);
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
-      structuredContent: { ...graph }
-    };
-  }
-);
 
 export function registerKnowledgeGraphResource(
   server: McpServer,
@@ -572,31 +2002,154 @@ export function registerKnowledgeGraphResource(
 }
 
 // Enable clients to subscribe to the knowledge-graph resource and receive
-// notifications/resources/updated when mutation tools change the graph.
-export function registerKnowledgeGraphSubscriptions(server: McpServer) {
+// notifications/resources/updated when mutation tools change the graph. The
+// subscribe and unsubscribe methods exist only on the 2025 protocol era; the
+// `subscribe` capability also lets a 2026-07-28 client name the resource in
+// its subscriptions/listen filter.
+export function registerKnowledgeGraphSubscriptions(
+  server: McpServer,
+  resourceSubscribers: Set<string>,
+) {
   server.server.registerCapabilities({ resources: { subscribe: true } });
-  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+  server.server.setRequestHandler("resources/subscribe", async (request) => {
     resourceSubscribers.add(request.params.uri);
     return {};
   });
-  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+  server.server.setRequestHandler("resources/unsubscribe", async (request) => {
     resourceSubscribers.delete(request.params.uri);
     return {};
   });
 }
 
-async function main() {
-  MEMORY_FILE_PATH = await ensureMemoryFilePath();
-  knowledgeGraphManager = new KnowledgeGraphManager(MEMORY_FILE_PATH);
-  registerKnowledgeGraphResource(server, knowledgeGraphManager);
-  registerKnowledgeGraphSubscriptions(server);
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+// Serve the server on stdio, writing the graph to the file
+// ensureMemoryFilePath picks. The first message the client sends picks the
+// connection's protocol era, and the factory builds the server for it. The
+// transport is a parameter so a test can run this whole startup path
+// in-process; the bin always uses the process's stdio. A transport error,
+// including one that stops the transport from starting, is reported on stderr.
+export async function main(transport?: Transport): Promise<StdioServerHandle> {
+  const memoryFilePath = await ensureMemoryFilePath();
+  const limits = graphLimitsFromEnv();
+  const locationWarning = memoryFileLocationWarning(memoryFilePath);
+  if (locationWarning) {
+    console.error(locationWarning);
+  }
+  installLockCleanup();
+  const handle = serveStdio(
+    ({ era }) => createServer(memoryFilePath, era, undefined, limits),
+    {
+      transport,
+      // serveStdio reports a transport that fails, including one that cannot
+      // start, here rather than by rejecting, so record the failure in the
+      // exit status for whatever supervises the process.
+      onerror: (error) => {
+        console.error("Transport error:", error);
+        process.exitCode = 1;
+      },
+    },
+  );
   console.error("Knowledge Graph MCP Server running on stdio");
+  return handle;
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+// True when this module is the program node was asked to run, rather than a
+// module imported by a test. Both sides go through realpath, because npm runs
+// the bin through a symlink (node_modules/.bin/mcp-server-memory).
+export function isMainModule(
+  entryPath: string | undefined = process.argv[1],
+  moduleUrl: string = import.meta.url,
+): boolean {
+  if (!entryPath) {
+    return false;
+  }
+  try {
+    return realpathSync(entryPath) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+/** The transports `--transport` can name. */
+export const TRANSPORTS = ["stdio", "streamable-http"] as const;
+export type TransportName = (typeof TRANSPORTS)[number];
+
+/**
+ * The transport the command line asks for: `--transport <name>` or
+ * `--transport=<name>`, else stdio. Throws on a missing or unknown name.
+ * Other arguments are ignored, as they always have been.
+ */
+export function parseTransport(args: string[]): TransportName {
+  let value: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--transport") {
+      value = args[++index];
+      if (value === undefined) {
+        throw new Error("--transport needs a value: stdio or streamable-http");
+      }
+    } else if (arg.startsWith("--transport=")) {
+      value = arg.slice("--transport=".length);
+    }
+  }
+  if (value === undefined) return "stdio";
+  if (!(TRANSPORTS as readonly string[]).includes(value)) {
+    throw new Error(
+      `Unknown transport ${JSON.stringify(value)}: expected stdio or streamable-http`,
+    );
+  }
+  return value as TransportName;
+}
+
+// Start the server on the transport args names, and hand back how to stop
+// it. Streamable HTTP listens on HOST:PORT (loopback:3001 by default) and also
+// stops, exiting the process, on SIGINT or SIGTERM. Closing the listener does
+// not wait for a tool call that is mid-write, so the exit that follows still
+// goes through the lock cleanup (#5595); a second signal does not wait for
+// the close either, and exits with the status the signal's default would give.
+export async function run(
+  args: string[] = process.argv.slice(2),
+): Promise<{ close: () => Promise<void> }> {
+  if (parseTransport(args) === "stdio") {
+    return main();
+  }
+  const memoryFilePath = await ensureMemoryFilePath();
+  const limits = graphLimitsFromEnv();
+  const locationWarning = memoryFileLocationWarning(memoryFilePath);
+  if (locationWarning) {
+    console.error(locationWarning);
+  }
+  const { httpEndpoint, startHttpServer } = await import("./http.js");
+  const running = await startHttpServer(memoryFilePath, httpEndpoint(), limits);
+  console.error(
+    `Knowledge Graph MCP Server running on Streamable HTTP at ${running.url}`,
+  );
+  installExitLockCleanup();
+  let stopping = false;
+  const stop = (signal: keyof typeof SIGNAL_EXIT_CODES) => {
+    if (stopping) {
+      process.exit(SIGNAL_EXIT_CODES[signal]);
+    } else {
+      stopping = true;
+      running.close().then(
+        () => process.exit(0),
+        (error: unknown) => {
+          console.error("Error shutting down:", error);
+          process.exit(1);
+        },
+      );
+    }
+  };
+  process.on("SIGINT", () => stop("SIGINT"));
+  process.on("SIGTERM", () => stop("SIGTERM"));
+  return running;
+}
+
+if (isMainModule()) {
+  run().catch((error: unknown) => {
+    console.error(
+      "Fatal error running server:",
+      error instanceof Error ? error.message : error,
+    );
+    process.exit(1);
+  });
+}

@@ -8,9 +8,13 @@ A Model Context Protocol server for Git repository interaction and automation. T
 
 Source: https://github.com/modelcontextprotocol/servers/tree/main/src/git
 
+Requires MCP Python SDK 2.x (`mcp>=2.3,<3`). The server is built on the SDK's high-level `MCPServer`: each tool is a typed Python function, and the SDK derives its input schema from the signature.
+
 Please note that mcp-server-git is currently in early development. The functionality and available tools are subject to change and expansion as we continue to develop and improve the server.
 
 ### Tools
+
+Every tool's `repo_path` is taken literally: neither a leading `~` nor `$NAME` or `${NAME}` is expanded, and a relative path is relative to the server's working directory.
 
 1. `git_status`
    - Shows the working tree status
@@ -33,26 +37,26 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Returns: Diff output of staged changes
 
 4. `git_diff`
-   - Shows differences between branches or commits
+   - Shows differences between branches or commits, or across a revision range
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `target` (string): Target branch or commit to compare with
+     - `target` (string): Target branch or commit to compare with, or a revision range: `a..b` (from `a` to `b`) or `a...b` (from the merge base of `a` and `b` to `b`). An omitted endpoint means `HEAD`; each endpoint must resolve and cannot start with `-`
      - `context_lines` (number, optional): Number of context lines to show (default: 3)
-   - Returns: Diff output comparing current state with target
+   - Returns: Diff output comparing the working tree with target, or the two endpoints of a range with each other
 
 5. `git_commit`
    - Records changes to the repository
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `message` (string): Commit message
-   - Returns: Confirmation with new commit hash
+   - Returns: Confirmation with new commit hash; an error if nothing is staged (as `git commit` without `--allow-empty`), except while a merge is in progress (`MERGE_HEAD` present), where git also allows an empty commit. While a merge is in progress the commit concludes it: its parents are `HEAD` and every `MERGE_HEAD` commit, and the merge state is cleared
 
 6. `git_add`
    - Adds file contents to the staging area
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `files` (string[]): Array of file paths to stage
-   - Returns: Confirmation of staged files
+     - `files` (string[]): Non-empty array of file paths to stage; `["."]` stages everything
+   - Returns: Confirmation of staged files, or a message saying nothing was staged when the call left the index unchanged
 
 7. `git_reset`
    - Unstages all staged changes
@@ -61,35 +65,44 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Returns: Confirmation of reset operation
 
 8. `git_log`
-   - Shows the commit logs with optional date filtering
+   - Shows the commit log, newest commit first. With only `repo_path` it returns the latest commits; the two timestamps are optional filters for a date range
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `max_count` (number, optional): Maximum number of commits to show (default: 10)
-     - `start_timestamp` (string, optional): Start timestamp for filtering commits. Accepts ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')
-     - `end_timestamp` (string, optional): End timestamp for filtering commits. Accepts ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')
-   - Returns: Array of commit entries with hash, author, date, and message
+     - `max_count` (number, optional): Maximum number of commits to show, at least 1 (default: 10)
+     - `start_timestamp` (string, optional): Only show commits at or after this time; omit for no lower bound. Accepts ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')
+     - `end_timestamp` (string, optional): Only show commits at or before this time; omit for no upper bound. Accepts ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')
+   - Returns: `Commit history:` followed by one entry per commit (hash, author, date and message), newest first. When a timestamp filter matches no commits, the text says so and suggests omitting both timestamps, rather than returning an empty history
 
 9. `git_create_branch`
    - Creates a new branch
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `branch_name` (string): Name of the new branch
-     - `base_branch` (string, optional): Base branch to create from (defaults to current branch)
-   - Returns: Confirmation of branch creation
+     - `base_branch` (string, optional): Branch, tag or commit SHA to create from (defaults to the current branch, or to the current commit when HEAD is detached)
+   - Returns: Confirmation of branch creation, naming the base branch, or the short SHA when the base is a commit
 10. `git_checkout`
    - Switches branches
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `branch_name` (string): Name of branch to checkout
-   - Returns: Confirmation of branch switch
-11. `git_show`
-   - Shows the contents of a commit
+   - Returns: Confirmation of branch switch, or `HEAD is now detached at <short sha>` when `branch_name` is not a branch (a sha, tag or other revision)
+11. `git_merge`
+   - Merges a branch into the current branch, or changes nothing
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `revision` (string): The revision (commit hash, branch name, tag) to show
-   - Returns: Contents of the specified commit
+     - `source_branch` (string): Branch, tag or commit to merge into the current branch (check out the branch to merge into first with `git_checkout`)
+     - `fast_forward_only` (boolean, optional): Only fast-forward, failing if the branches have diverged (default `true`). `false` lets Git create a merge commit when they have
+   - Returns: `Fast-forwarded`, `Merged ... with merge commit <short sha>`, or `Already up to date`
+   - Refuses a detached HEAD, a working tree with uncommitted changes, a merge already in progress, and a merge that would overwrite an ignored local file, whether it fast-forwards or makes a merge commit. A merge that stops on conflicts is aborted (`git merge --abort`) and the error names the conflicting files, so the repository is left as it was
+   - Directory renames are not followed: a file the source adds in a directory the current branch renamed is merged at the path the source gave it
+12. `git_show`
+   - Shows the contents of a commit, or of a file or directory at a revision
+   - Inputs:
+     - `repo_path` (string): Path to Git repository
+     - `revision` (string): The revision (commit hash, branch name, tag) or object spec (`HEAD:path/to/file`) to show
+   - Returns: Contents of the specified commit, file content, or directory listing
 
-12. `git_branch`
+13. `git_branch`
    - List Git branches
    - Inputs:
      - `repo_path` (string): Path to the Git repository.
@@ -97,6 +110,43 @@ Please note that mcp-server-git is currently in early development. The functiona
      - `contains` (string, optional): The commit sha that branch should contain. Do not pass anything to this param if no commit sha is specified
      - `not_contains` (string, optional): The commit sha that branch should NOT contain. Do not pass anything to this param if no commit sha is specified
    - Returns: List of branches
+
+14. `git_remote`
+   - Lists the repository's remotes with their fetch and push URLs, like `git remote -v`
+   - Inputs:
+     - `repo_path` (string): Path to the Git repository.
+   - Returns: One line per remote and direction, `<name>\t<url> (fetch)` or `(push)` (a partial clone's fetch line ends with its filter, such as ` [blob:none]`), or `No remotes configured`
+   - A credential embedded in a URL is never returned: the whole userinfo of a URL such as `https://user:token@host/...` or `https://token@host/...` is shown as `<redacted>`, and so is every query value (`?private_token=<redacted>`, keeping the parameter names) and a non-empty fragment (`#<redacted>`). An SSH username (`ssh://git@host/...`) is kept, since it names an account rather than authenticating one; a password after it is redacted. A remote-helper address (`https::https://user:token@host/...`) has its inner URL redacted the same way. A URL where a `?` or `#` comes before the userinfo's `@` (`https://host?t=a@b`) cannot be split safely, so it is shown as `https://<redacted>`. A token carried as a path segment (`https://host/token/SECRET/r.git`) is not redacted, since it cannot be told apart from a repository name. A value that holds a URL anywhere but at its start (` https://user:token@host/...`, with leading whitespace) cannot be split safely, so it is shown as `<redacted>`; a remote name holding a tab is matched against the configured names, so the URL after it is still redacted. scp-style addresses (`git@host:path`) and local paths are shown as configured, and a `file://` URL keeps its `?` and `#` parts, which belong to a local file name. A line that cannot be parsed is shown as `<redacted>`, and if a configured remote URL (or `insteadOf` rewrite) contains a newline, which git itself refuses, the tool returns an error instead of a listing.
+
+### Protocol versions
+
+The server speaks both eras of the Model Context Protocol over stdio, with nothing to configure: a **2026-07-28** client (discovered with `server/discover`, no session) and a **2025-11-25** client (the `initialize` handshake). The client's first request decides which. Tools behave the same in both.
+
+Roots is deprecated in 2026-07-28, and this server never asks a client for Roots in either era: repository access comes from `--repository` alone, or, with no `--repository`, from each tool call's `repo_path`. Methods the 2026-07-28 specification removes, such as `ping`, are answered only on a 2025-11-25 connection.
+
+### Errors
+
+- **A tool that fails** returns a result with `isError: true` whose text is `Error executing tool <name>: <message>`, so the model can read it and correct the call. This covers git errors (an unknown revision, a failed command), a `repo_path` that is not a repository or is outside `--repository`, the flag-injection guards, and arguments that do not match the tool's input schema.
+- **An unknown tool name** is a protocol error, JSON-RPC `-32602` (`Unknown tool: <name>`), as the specification requires in both eras. Before 2.0.0 it was an `isError` result.
+
+### Prompts
+
+Beside its tools, the server offers two prompts, which a client typically shows the user as slash commands. Each reads the repository when it is requested and returns one user message that embeds the changes, ready to send to the model. They open the repository the way the tools do, so `--repository` confines them too, and the same flag-injection guards apply. They behave the same in both protocol eras.
+
+1. `git_commit_message`
+   - Asks the model for a commit message for the staged changes
+   - Arguments:
+     - `repo_path` (string, required): Path to the Git repository
+   - Returns: A message embedding the staged diff and asking for a commit message, or one saying nothing is staged
+
+2. `git_summarize_changes`
+   - Asks the model to summarize the working tree's changes, or the diff against a branch or commit
+   - Arguments:
+     - `repo_path` (string, required): Path to the Git repository
+     - `target` (string, optional): Branch or commit to diff against. Without it, the working tree's status and its staged and unstaged diffs are summarized
+   - Returns: A message embedding those changes and asking for a summary, or one saying there are none
+
+A prompt request that fails (a `repo_path` that is not a repository or is outside `--repository`, an unknown `target`, a `target` starting with `-`) is a JSON-RPC `-32602` error carrying the message a tool would report, since `prompts/get` has no `isError` result.
 
 ## Installation
 
@@ -121,6 +171,76 @@ python -m mcp_server_git
 
 ## Configuration
 
+> [!IMPORTANT]
+> **Without `--repository`, the server reads and writes any Git repository the server process can reach.** Each tool call names its own `repo_path`, and that holds for the tools that change a repository too (`git_add`, `git_commit`, `git_reset`, `git_create_branch`, `git_checkout`, `git_merge`). `--repository` is the only confinement the server offers: it never asks the client for Roots, in either protocol era. Set `--repository` whenever the server is used with prompts or content that are not fully trusted. It admits the whole enclosing repository, not only the directory you name, as the next paragraph describes.
+
+`--repository` (`-r`) accepts any path inside a Git working tree. At startup the server walks up to the enclosing repository root, the way `git rev-parse --show-toplevel` does, so `--repository .` works when a shared config is launched from any subdirectory of the repository. A path inside the repository therefore allows tool calls anywhere in that repository, not only under the subdirectory given. A path that does not exist, or is not inside a Git repository, is logged as a one-line error at startup.
+
+A tool call's `repo_path` must be inside that repository, and so must the directories Git then uses for it: a repository nested inside whose `.git` file, `commondir` or `core.worktree` points outside is refused. The `--repository` root itself may use a Git directory outside it only when that directory names the root back. A linked worktree's Git directory lives under the main repository's `.git` (`.git/worktrees/<name>`), and the main repository's record of the worktree names the root back. Only the worktree itself may use that directory, so a repository nested in the worktree whose `.git` names it, or the main repository's `.git`, is refused. A submodule checkout can be the `--repository` too, or any root whose Git directory's own `config` sets `core.worktree` back to it, as a submodule's (`.git/modules/<name>` in the superproject) does. Any other root whose `.git` file or `commondir` names a directory outside it, including one made with `git init --separate-git-dir`, is refused on every call, and the server logs a warning saying so at startup. The root's Git directory and common directory are fixed when the server starts: if the root's `.git` is later replaced, or gains a `commondir`, so that Git would use a different directory outside the root, the call is refused. With `--repository` set, the server also refuses a repository whose Git directory:
+
+- names alternate object stores (`objects/info/alternates` or `objects/info/http-alternates` with any entry), wherever they are. A clone made with `--reference` or `--shared` therefore cannot be used under `--repository`; `git repack -a -d` and then deleting `objects/info/alternates` makes it self-contained.
+- holds a symbolic link (at `objects`, `refs`, `index`, `HEAD` or anywhere else in it) that resolves outside both the allowed repository and that Git directory. A link that stays inside is followed, and what it leads to is checked the same way. A `hooks` directory linked elsewhere is allowed, since no hook runs.
+- holds a Windows directory junction that resolves outside both, anywhere in it. A junction is judged like a symbolic link: one that stays inside is followed and what it leads to is checked, and a `hooks` junction is allowed.
+
+It also refuses a repository whose index (`.git/index`) names a path Git would read outside the working tree: an entry that is absolute, or has an empty, `.`, `..` or `.git` component (on Windows also one with a `:`, or with `\` as a separator), which is what `git add` refuses to write. Git reads an index as it finds it, so a hand-written one could otherwise make `git_diff_unstaged`, `git_diff` and `git_status` show files outside the repository. For the same reason, every Git command the server runs, with or without `--repository`, sets `core.untrackedCache` to `false`: the untracked cache is kept in the index and names the directories `git status` lists, so Git scans the working tree instead.
+
+These checks run when a tool call opens the repository, and again after each Git command in the call that writes the working tree (`git_checkout`, `git_merge` and the `git merge --abort` after a conflict, and the autostash `git_commit` reapplies when it concludes a merge), since such a write can change the repository's configuration (a `.git/config` linked to a tracked file that gains a `core.worktree`). If the repository no longer passes, the call stops with an error before it runs another Git command, and the working tree stays as that command wrote it; a merge that conflicted is then still in progress rather than aborted.
+
+### A repository's own programs
+
+A repository's configuration and hooks travel with it (an unpacked archive, a shared folder, a vendored tree), so the server never runs a program they name, with or without `--repository`. Every Git command it runs overrides, through `GIT_CONFIG_COUNT`, the settings that would start one:
+
+- `core.fsmonitor` is `false`, and `core.hooksPath` points at the null device, so no hook runs; `git_commit` also skips the hooks GitPython would run itself (`pre-commit`, `commit-msg`, `post-commit`).
+- Diffs pass `--no-ext-diff` and `--no-textconv`, so `diff.external`, `diff.<driver>.command` and `diff.<driver>.textconv` are ignored.
+- Each filter driver (`filter.<name>.clean`, `smudge`, `process`) and merge driver (`merge.<name>.driver`) that the repository's own configuration defines is emptied, including one with an empty name (`[filter ""]`, selected by `filter=`): files are staged and checked out unfiltered, and a file a merge driver would have merged is a conflict, which `git_merge` aborts. Drivers from your global or system configuration, such as Git LFS's, keep working.
+- Git LFS's driver, trusted as yours, reads its own settings from the repository's configuration, so each program that configuration names for it is emptied too: an extension's `lfs.extension.<name>.clean` and `smudge`, and a transfer agent's `lfs.customtransfer.<name>.path` and `args` (and `lfs.standalonetransferagent`). A tool that would run an emptied extension fails with Git LFS's error. Git LFS never downloads an object either (`GIT_LFS_SKIP_SMUDGE=1`), since a download runs the SSH command, credential helper and askpass program set for an endpoint the repository chooses: `git_checkout` and `git_merge` write each Git LFS file as its pointer file, and `git lfs pull` (or `git lfs checkout`, when the objects are already local) replaces the pointers with the content afterwards.
+- The repository's configuration can depend on its working tree (an `[include]` or `[includeIf]` path into it, or a `.git/config` linked to a tracked file), so a tool that writes the working tree (`git_checkout`, `git_merge`, and the `git merge --abort` after a conflict) reads the drivers again before it runs any other Git command, and a driver that the files it wrote define is emptied as well.
+- `commit.gpgSign` and `merge.verifySignatures` are `false`, and `git_merge` passes `--no-gpg-sign` and `--no-verify-signatures`. Each `branch.<name>.mergeOptions` the repository's own configuration sets is emptied, since Git reads it as command-line options. `submodule.recurse` and `merge.autoStash` are `false`, and `core.pager` is `cat`.
+- Git never fetches a missing object from a promisor remote by itself (`GIT_NO_LAZY_FETCH=1`), since that fetch runs the transport program the repository's configuration names (`remote.<name>.uploadpack`, `core.sshCommand`). In a partial clone, or any repository that declares a promisor remote, a tool that needs an object that is not on disk reports it missing. A Git too old to honor the variable (before 2.45.1, other than the maintenance releases 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4 and 2.44.1 made with it) refuses a repository that declares a promisor remote (`remote.<name>.promisor`, `remote.<name>.partialCloneFilter` or `extensions.partialClone`, with or without a remote name).
+- `maintenance.auto` is `false` and `gc.auto` is `0`, so no tool starts Git's automatic maintenance (which `git merge` runs when it finishes), whose garbage collection would run the commands a repository's `gc.recentObjectsHook` names. Repositories the server works in are not garbage-collected automatically; your own Git commands still do it.
+- `git_status`, `git_diff_unstaged` and `git_diff` pass `--ignore-submodules=dirty`, because looking for changes inside a submodule runs Git under the submodule's own configuration. A submodule whose checked-out commit moved is still reported; changes inside one are not, so run the tool on the submodule's path to see them.
+- `diff.submodule` is `short`, so a diff reports a submodule whose commit moved as a `Subproject commit` line rather than running a nested `git diff` inside it, which would not carry the flags above.
+- `git_add` lets Git check whether a checked-out submodule changed, which runs Git inside it under its own configuration, so the filter and merge drivers each checked-out submodule (and each submodule inside one) defines are emptied too, the same way as the repository's own. `git_checkout` passes `--quiet`, which skips that check.
+
+This needs Git 2.31 or later, and 2.33 or later for a repository with a checked-out submodule (older Git does not pass the overrides to the Git it runs inside one); with an older Git every tool call on such a repository fails with an error saying so, rather than run unprotected.
+
+### Commit identity
+
+`git_commit` has no identity setting of its own. It takes the author and the committer from the same places `git commit` does, in this order:
+
+1. The server process's environment: `GIT_AUTHOR_NAME` and `GIT_AUTHOR_EMAIL` for the author, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` for the committer. The author and the committer are resolved separately, so set all four (usually to the same name and email).
+2. `user.name` and `user.email` from Git config: the repository's `.git/config`, then `~/.gitconfig`, then `$XDG_CONFIG_HOME/git/config` (by default `~/.config/git/config`), then `/etc/gitconfig`.
+
+Unlike `git commit`, the server does not refuse to commit when neither is set. It falls back to the operating-system user and host name, so a commit made in a container is recorded as something like `app <app@3f2a1b9c8d7e>`. A local install usually finds your own `~/.gitconfig`; a Docker container has none, so give it an identity explicitly.
+
+For a local command (`uvx`, `python -m mcp_server_git`), add an `env` block to the server's entry in your client configuration:
+
+```json
+"mcpServers": {
+  "git": {
+    "command": "uvx",
+    "args": ["mcp-server-git", "--repository", "path/to/git/repo"],
+    "env": {
+      "GIT_AUTHOR_NAME": "Your Name",
+      "GIT_AUTHOR_EMAIL": "you@example.com",
+      "GIT_COMMITTER_NAME": "Your Name",
+      "GIT_COMMITTER_EMAIL": "you@example.com"
+    }
+  }
+}
+```
+
+For Docker, pass the variables to `docker run` with `-e`, as the Docker examples below do. Alternatively, mount your gitconfig read-only in place of the four `-e` pairs. The image runs as the unprivileged `app` user, whose home is `/home/app`, so it goes at `/home/app/.gitconfig`:
+
+```json
+"args": [
+  "run", "--rm", "-i",
+  "--mount", "type=bind,src=/Users/username/.gitconfig,dst=/home/app/.gitconfig,readonly",
+  "--mount", "type=bind,src=/Users/username,dst=/Users/username",
+  "mcp/git"
+]
+```
+
 ### Usage with Claude Desktop
 
 Add this to your `claude_desktop_config.json`:
@@ -142,12 +262,22 @@ Add this to your `claude_desktop_config.json`:
 <summary>Using docker</summary>
 
 * Note: replace '/Users/username' with a path that you want to be accessible by this tool
+* Note: the `-e` lines set the identity `git_commit` records; see [Commit identity](#commit-identity)
+* Note: the image runs as the unprivileged `app` user, not root, and trusts every repository mounted into it (`safe.directory '*'`), since a bind mount rarely shows up owned by that user. On a Linux host, where a bind mount keeps the host's file ownership, add `"--user", "1000:1000"` (your own `id -u` and `id -g`) before `mcp/git` so the server can write to the repository and its commits leave files you own; with `--user`, mount a gitconfig at `/.gitconfig` rather than `/home/app/.gitconfig`, or use the `-e` lines. Docker Desktop on macOS and Windows needs neither.
 
 ```json
 "mcpServers": {
   "git": {
     "command": "docker",
-    "args": ["run", "--rm", "-i", "--mount", "type=bind,src=/Users/username,dst=/Users/username", "mcp/git"]
+    "args": [
+      "run", "--rm", "-i",
+      "-e", "GIT_AUTHOR_NAME=Your Name",
+      "-e", "GIT_AUTHOR_EMAIL=you@example.com",
+      "-e", "GIT_COMMITTER_NAME=Your Name",
+      "-e", "GIT_COMMITTER_EMAIL=you@example.com",
+      "--mount", "type=bind,src=/Users/username,dst=/Users/username",
+      "mcp/git"
+    ]
   }
 }
 ```
@@ -224,14 +354,14 @@ Add to your Zed settings.json:
 <summary>Using uvx</summary>
 
 ```json
-"context_servers": [
-  "mcp-server-git": {
-    "command": {
-      "path": "uvx",
+{
+  "context_servers": {
+    "mcp-server-git": {
+      "command": "uvx",
       "args": ["mcp-server-git"]
     }
   }
-],
+}
 ```
 </details>
 
@@ -239,14 +369,14 @@ Add to your Zed settings.json:
 <summary>Using pip installation</summary>
 
 ```json
-"context_servers": {
-  "mcp-server-git": {
-    "command": {
-      "path": "python",
+{
+  "context_servers": {
+    "mcp-server-git": {
+      "command": "python",
       "args": ["-m", "mcp_server_git"]
     }
   }
-},
+}
 ```
 </details>
 
@@ -268,6 +398,31 @@ Add to your Zed settings.json:
 ```
 </details>
 
+## Streamable HTTP
+
+The server talks over stdio by default. With `--transport streamable-http` it
+runs on its own as an HTTP service instead, serving one MCP endpoint, `/mcp`,
+to any number of clients of either protocol era:
+
+```sh
+uvx mcp-server-git --transport streamable-http --repository path/to/git/repo
+```
+
+It listens on `127.0.0.1:3001` unless `HOST` and `PORT` say otherwise (for
+example `PORT=8080`); `HOST=0.0.0.0` exposes it to every machine that can reach
+this one, so set it deliberately. Point a client at the URL, such as
+`http://127.0.0.1:3001/mcp`, instead of giving it a command:
+
+```json
+{
+  "mcpServers": {
+    "git": { "type": "http", "url": "http://127.0.0.1:3001/mcp" }
+  }
+}
+```
+
+Every other option works as it does over stdio; `--repository` matters more here, since any client that can reach the port can use the server. A browser page from any origin but localhost is refused with `403`, whatever `HOST` is, to guard against DNS rebinding; on loopback the SDK also checks each request's `Host` header.
+
 ## Debugging
 
 You can use the MCP inspector to debug the server. For uvx installations:
@@ -288,7 +443,25 @@ help you debug any issues.
 
 ## Development
 
-If you are doing local development, there are two ways to test your changes:
+### Tests and coverage
+
+The test suite drives `serve()` in-process through an MCP `ClientSession`
+(see `tests/conftest.py`), and `tests/test_eras.py` runs a `Client` against it
+as a 2026-07-28 and as a 2025-11-25 client. From `src/git`:
+
+```bash
+uv run --frozen pytest                 # the tests
+uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json
+```
+
+The second command adds branch coverage of `src/mcp_server_git`, printed per
+file and written to `coverage.json` (ignored by git). Every file must stay at
+or above 90% of its lines and 90% of its branches. Code that cannot be reached
+is marked `# pragma: no cover  # <reason>` rather than lowering that bar.
+
+### Trying changes in a client
+
+There are two ways to try your changes in a client:
 
 1. Run the MCP inspector to test your changes. See [Debugging](#debugging) for run instructions.
 
@@ -305,6 +478,10 @@ If you are doing local development, there are two ways to test your changes:
         "run",
         "--rm",
         "-i",
+        "-e", "GIT_AUTHOR_NAME=Your Name",
+        "-e", "GIT_AUTHOR_EMAIL=you@example.com",
+        "-e", "GIT_COMMITTER_NAME=Your Name",
+        "-e", "GIT_COMMITTER_EMAIL=you@example.com",
         "--mount", "type=bind,src=/Users/username/Desktop,dst=/projects/Desktop",
         "--mount", "type=bind,src=/path/to/other/allowed/dir,dst=/projects/other/allowed/dir,ro",
         "--mount", "type=bind,src=/path/to/file.txt,dst=/projects/path/to/file.txt",
